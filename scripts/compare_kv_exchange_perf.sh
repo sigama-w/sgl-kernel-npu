@@ -42,6 +42,9 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 OUR_BENCH="${REPO_ROOT}/benchmark/hicache_offload/bench_kv_exchange.py"
 MF_EXAMPLE_DIR="${MF_EXAMPLE_DIR:-/mnt/share/w00937173/offload/kv_exchange_offload}"
 MF_SHADOW="${MF_SHADOW_DIR:-/mnt/share/w00937173/mf_shadow}"
+OURS_LOG=/tmp/cmp_ours.log
+MF_LOG=/tmp/cmp_mf.log
+rm -f "${OURS_LOG}" "${MF_LOG}"
 
 POOL_PAGES=32768
 PAGES=32
@@ -88,7 +91,7 @@ esac
 # bench 的 host 缓冲按整池分配: pool_bytes = POOL x LAYERS x PAGE_SIZE x 2组件 x WIDTH x elem。
 # 大层数 + 大池会超过物理内存, 按预算钳制 (带宽只取决于传输页数, 池大小不影响结果,
 # 只影响索引散布范围)。
-HOST_BUDGET_GB=${HOST_BUDGET_GB:-24}
+HOST_BUDGET_GB=${HOST_BUDGET_GB:-8}
 PAGE_HOST_BYTES=$(( LAYERS * PAGE_SIZE * 2 * WIDTH * ELEM ))
 MAX_POOL=$(( HOST_BUDGET_GB * 1073741824 / PAGE_HOST_BYTES ))
 if [ "${POOL_PAGES}" -gt "${MAX_POOL}" ]; then
@@ -130,8 +133,7 @@ if [ "${RUN_OURS}" -eq 1 ]; then
     [ -n "${START_DIMS}" ] && OUR_ARGS+=(--start-dims "${START_DIMS}")
     ( cd "${REPO_ROOT}" && \
       PYTHONPATH="${REPO_ROOT}/python/sgl_kernel_npu" \
-      "${RUNNER[@]}" python3 "${OUR_BENCH}" "${OUR_ARGS[@]}" )
-    echo "  (注: 本输出为 GB/s 十进制; x0.931 换算 GiB/s 后与 mf 直接对比)"
+      "${RUNNER[@]}" python3 "${OUR_BENCH}" "${OUR_ARGS[@]}" ) 2>&1 | tee "${OURS_LOG}"
     echo
 fi
 
@@ -148,12 +150,44 @@ if [ "${RUN_MF}" -eq 1 ]; then
       "${RUNNER[@]}" python3 kv_exchange_offload.py \
           --mode aiv --world_size "${WORLD_SIZE}" \
           --data_mibs "${MF_MIBS}" --num_layers "${LAYERS}" \
-          --k_dim "${MF_K_DIM}" --v_dim "${MF_V_DIM}" )
-    echo "  (注: 本输出为 GiB/s; page_first 行 = sglang 真实 host 布局, 是对比关键行)"
+          --k_dim "${MF_K_DIM}" --v_dim "${MF_V_DIM}" ) 2>&1 | tee "${MF_LOG}"
     echo
 fi
 
-echo "================ 判读 ================"
-echo "  1. 对比 page_first 带宽 (sglang 真实布局): 我们(GB/s x0.931=GiB/s) vs mf aiv"
-echo "  2. -T 跑出的第二组用于 NUMA 归因: 与第一组差异大 -> mf 慢因是亲和绑定"
-echo "  3. -d 扫参曲线 -> AIV 核并行度上限 (62=2核 为 mf 原语义)"
+# ---------------- 自动汇总：从两份日志提取带宽数字并对比 ----------------
+extract_ours() {  # 第一个 (默认核数) 的指定方向 GB/s
+    awk -v d="$1" '$0 ~ "dir="d && $0 ~ /GB\/s/ {for(i=1;i<=NF;i++) if($i=="GB/s"){print $(i-1); exit}}' "$2"
+}
+extract_mf() {    # 指定布局的 GiB/s
+    awk -v l="$1" '$0 ~ "layout:"l {f=1; next} f && /bandwidth:/ {for(i=1;i<=NF;i++) if($i=="GiB/s"){print $(i-1); exit}}' "$2"
+}
+
+echo "================ 性能对比总结 ================"
+echo "  场景: ${TOKENS} token x ${LAYERS} 层 | ${MODES} 大页 | 核数(我们)=mf原语义2核 | taskset=${TASKSET_CPUS:-none}"
+if [ "${RUN_OURS}" -eq 1 ]; then
+    echo "  [迁移版 kv_exchange]  (GB/s, 十进制)"
+    O_H2D=$(extract_ours H2D "${OURS_LOG}")
+    O_D2H=$(extract_ours D2H "${OURS_LOG}")
+    [ -n "${O_H2D}" ] && echo "    H2D(换入): ${O_H2D} GB/s"
+    [ -n "${O_D2H}" ] && echo "    D2H(换出): ${O_D2H} GB/s"
+    [ -z "${O_H2D}" ] && echo "    (未解析到结果, 见上方日志)"
+    N_SWEEP=$(grep -c 'GB/s' "${OURS_LOG}" 2>/dev/null || true)
+    [ "${N_SWEEP:-0}" -gt 2 ] && echo "    (含 -d 扫参共 ${N_SWEEP} 行, 上表取默认核数首行; 扫参全表见上方)"
+fi
+if [ "${RUN_MF}" -eq 1 ]; then
+    echo "  [mf 原生 offload]  (GiB/s)"
+    M_PF=$(extract_mf page_first "${MF_LOG}")
+    M_LF=$(extract_mf layer_first "${MF_LOG}")
+    [ -n "${M_PF}" ] && echo "    page_first(H2D, HiCache真实布局): ${M_PF} GiB/s"
+    [ -n "${M_LF}" ] && echo "    layer_first(H2D, 参考): ${M_LF} GiB/s"
+    [ -z "${M_PF}" ] && echo "    (未解析到结果, 见上方日志)"
+fi
+if [ -n "${O_H2D:-}" ] && [ -n "${M_PF:-}" ]; then
+    awk -v o="${O_H2D}" -v m="${M_PF}" 'BEGIN{
+        ogi=o/1.024
+        printf "  [结论] page_first H2D: 我们 %.2f GiB/s vs mf %.2f GiB/s -> 加速比 %.1fx\n", ogi, m, ogi/m
+        if (ogi >= m*0.9)      print "         判定: 迁移版 >= mf 原生, 迁移无性能损失"
+        else                   print "         判定: 迁移版低于 mf 原生, 需排查"
+    }'
+fi
+echo
