@@ -248,6 +248,14 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "ScalarType? dst_type=None, int quant_mode=1, int group_size=128, bool round_scale=False, "
         "bool ue8m0_scale=False, bool output_origin=False, int group_list_type=0, "
         "float clamp_value=0.0) -> (Tensor, Tensor, Tensor)");
+
+    m.def("kv_exchange(Tensor meta, int block_dim=64) -> ()");
+
+    m.def("hugepage_host_alloc(int num_bytes, int device_id) -> (int, int, int)");
+
+    m.def("hugepage_host_free(int host_ptr, int device_id) -> ()");
+
+    m.def("hugepage_host_free_all(int device_id) -> ()");
 #endif
 
 #ifdef BUILD_CATLASS_MODULE
@@ -271,6 +279,19 @@ TORCH_LIBRARY_IMPL(npu, CatchAll, m)
     m.impl("shm_allocator_create_and_register", TORCH_FN(sglang::npu_kernel::shm_allocator_create_and_register));
 
     m.impl("shm_allocator_free_all", TORCH_FN(sglang::npu_kernel::shm_allocator_free_all));
+}
+#endif
+
+#ifdef SGL_KERNEL_ENABLE_A5_ONLY_OPS
+TORCH_LIBRARY_IMPL(npu, CatchAll, m)
+{
+    // Hugepage host allocations are control-plane operations without Tensor
+    // arguments, so backend dispatch cannot infer PrivateUse1.
+    m.impl("hugepage_host_alloc", TORCH_FN(sglang::npu_kernel::hugepage_host_alloc));
+
+    m.impl("hugepage_host_free", TORCH_FN(sglang::npu_kernel::hugepage_host_free));
+
+    m.impl("hugepage_host_free_all", TORCH_FN(sglang::npu_kernel::hugepage_host_free_all));
 }
 #endif
 
@@ -397,6 +418,8 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     // The host takes c10::optional directly, so the optionals are registered as-is rather than
     // being unwrapped to empty tensors here.
     m.impl("swiglu_group_quant", TORCH_FN(sglang::npu_kernel::swiglu_group_quant));
+
+    m.impl("kv_exchange", TORCH_FN(sglang::npu_kernel::kv_exchange));
 #endif
 
 #ifdef BUILD_CATLASS_MODULE

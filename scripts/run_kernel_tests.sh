@@ -62,7 +62,9 @@ CACHE_TESTS=(
     test_cache_assign.py
     test_cache_loc_bounds.py
     test_cache_update.py
+    test_hugepage_host_allocator.py
     test_inplace_assign_cache.py
+    test_kv_exchange.py
     test_lightning_indexer.py
     test_transfer_kv_dim_exchange.py
 )

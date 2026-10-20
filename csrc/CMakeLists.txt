@@ -110,6 +110,9 @@ if(SGL_KERNEL_ENABLE_A5_ONLY_OPS)
         ${PROJECT_OP_SRC_BASE}/kv_compress_epilog/op_host/kv_compress_epilog.cpp
         ${PROJECT_OP_SRC_BASE}/situ_mxfp8_quant/op_host/situ_mxfp8_quant.cpp
         ${PROJECT_OP_SRC_BASE}/swiglu_group_quant/op_host/swiglu_group_quant.cpp
+        ${PROJECT_OP_SRC_BASE}/hicache_offload/kv_exchange/op_host/kv_exchange.cpp
+        ${PROJECT_OP_SRC_BASE}/hicache_offload/hugepage_host_allocator/hugepage_host_allocator.cpp
+        ${PROJECT_OP_SRC_BASE}/hicache_offload/hugepage_host_allocator/hugepage_host_allocator_op.cpp
     )
 endif()
 if(BUILD_CATLASS_MODULE)
@@ -147,6 +150,7 @@ set(NO_WORKSPACE_KERNEL_SRCS
 if(SGL_KERNEL_ENABLE_A5_ONLY_OPS)
     list(APPEND NO_WORKSPACE_KERNEL_SRCS
         ${PROJECT_OP_SRC_BASE}/situ_mxfp8_quant/op_kernel/situ_mxfp8_quant.cpp
+        ${PROJECT_OP_SRC_BASE}/hicache_offload/kv_exchange/op_kernel/kv_exchange_kernel.cpp
     )
 endif()
 # A3-only no-workspace kernels
@@ -386,6 +390,7 @@ target_include_directories(${OP_PLUGIN_NAME} PRIVATE
         ${PROJECT_OP_SRC_BASE}/causal_conv1d_update/op_host/stub
         ${PROJECT_OP_SRC_BASE}/causal_conv1d/op_host
         ${PROJECT_OP_SRC_BASE}/sparsity_driven_kv_offload/shm_allocator
+        ${PROJECT_OP_SRC_BASE}/hicache_offload/hugepage_host_allocator
         ${PROJECT_OP_SRC_BASE}/sparse_attn_sharedkv/op_host
         ${PROJECT_OP_SRC_BASE}/sparse_flash_attention/op_host
         ${PROJECT_OP_SRC_BASE}/sparse_flash_attention/op_host/tiling

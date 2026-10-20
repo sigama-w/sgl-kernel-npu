@@ -244,6 +244,44 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> swiglu_group_quant(
     c10::optional<at::ScalarType> dst_type, int64_t quant_mode,
     int64_t group_size, bool round_scale, bool ue8m0_scale, bool output_origin,
     int64_t group_list_type, double clamp_value);
+
+/**
+ * @brief HiCache L1 <-> L2 KV cache exchange driven by device-resident
+ * metadata (ported from MemFabric acc_offload kv_exchange).
+ *
+ * @param [in] meta int64 device tensor describing the transfer: 8-value
+ * header (num_components, num_pages, page_size, direction 1=H2D/2=D2H,
+ * device_indices_ptr, host_indices_ptr, host_layout_mode, reserved) plus
+ * 9 values per component (device_base, host_base/DVA, device_layer_pitch,
+ * device_page_pitch, host_page_pitch, host_layer_pitch, width, layer_lo,
+ * layer_hi), at most 4 components
+ * @param [in] block_dim number of AIV cores to launch (64 on Ascend950;
+ * only cores >= 62 participate)
+ */
+void kv_exchange(const at::Tensor &meta, int64_t block_dim);
+
+/**
+ * @brief Allocate hugepage-backed host memory and register it with the NPU
+ * driver (1GB hugepage first, falling back to 2MB and regular pages;
+ * SGLANG_HICACHE_HUGEPAGE_MODE pins one page size or disables hugepages).
+ *
+ * Returns:
+ *   host pointer as int64_t
+ *   device-visible pointer (DVA) as int64_t
+ *   backing page size actually used as int64_t
+ */
+std::tuple<int64_t, int64_t, int64_t> hugepage_host_alloc(int64_t num_bytes,
+                                                          int64_t device_id);
+
+/**
+ * @brief Unregister and release one hugepage host allocation.
+ */
+void hugepage_host_free(int64_t host_ptr, int64_t device_id);
+
+/**
+ * @brief Unregister and release all hugepage host allocations for one device.
+ */
+void hugepage_host_free_all(int64_t device_id);
 #endif
 
 #ifdef BUILD_CATLASS_MODULE
