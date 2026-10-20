@@ -54,13 +54,22 @@ if [ -z "${KERN_A}" ] || [ ! -f "${KERN_A}" ]; then
     exit 1
 fi
 
-# Step 2: torch_npu adapter object (same as mf install.sh L420-438)
+# Step 2: torch_npu adapter object (same as mf install.sh L420-438, plus source-tree
+# include dirs: the official wheel flattens headers next to launch.cpp, but a raw
+# checkout needs them pointed at explicitly)
+acc_root=$(cd "${SRC_OPERATORS}/../.." && pwd)
 g++ -c -fPIC -std=c++17 -O3 -fstack-protector-strong \
     -Wno-unused-parameter -Wno-unused-function -Wunused-value -Wcast-align \
     -Wcast-qual -Wwrite-strings -Wsign-compare -Wextra \
     -fvisibility-inlines-hidden -ftrapv \
     ${abi_flag} \
     -DACC_SOC_VERSION_${ASCEND_VERSION} \
+    -I "${SRC_OPERATORS}" \
+    -I "${acc_root}/include/host" \
+    -I "${acc_root}/csrc" \
+    -I "${acc_root}/csrc/common" \
+    -I "${acc_root}/csrc/allocator" \
+    -I "${acc_root}/csrc/launch" \
     -isystem ${ascend_home}/include \
     -isystem ${ascend_home}/include/experiment/runtime/runtime/ \
     -isystem ${torch_dir}/include \
