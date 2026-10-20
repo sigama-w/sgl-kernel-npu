@@ -46,6 +46,15 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--modes", type=str, default="auto,off", help="comma list: auto / 1g / 2m / off")
     p.add_argument("--directions", type=str, default="h2d,d2h")
+    p.add_argument(
+        "--start-dims",
+        type=str,
+        default="",
+        help=(
+            "comma list of KV_EXCHANGE_START_DIM overrides (active cores = "
+            "block_dim - start_dim), e.g. '62,60,56,48,32,0'; empty = default 62"
+        ),
+    )
     return p.parse_args()
 
 
@@ -56,7 +65,7 @@ def make_host_buffer(shape, dtype):
     return tensor, host_ptr, dev_ptr
 
 
-def bench_direction(direction, indices_cpu, args, dtype, layers, width):
+def bench_direction(direction, indices_cpu, args, dtype, layers, width, start_dim=None):
     """Returns (seconds_per_iter, bytes_moved_per_iter)."""
     device = "npu"
     pool_pages, pages, page_size = args.pool_pages, args.pages, args.page_size
@@ -98,6 +107,7 @@ def bench_direction(direction, indices_cpu, args, dtype, layers, width):
         host_indices_ptr=host_indices.data_ptr(),
         host_layout_mode=HOST_LAYOUT_PAGE_FIRST,
         components=components,
+        start_dim=start_dim,
     )
     meta = torch.tensor(vals, dtype=torch.int64, device=device)
 
@@ -121,12 +131,14 @@ def bench_direction(direction, indices_cpu, args, dtype, layers, width):
     return elapsed / args.iters, bytes_moved
 
 
-def run_mode(mode, direction, indices_cpu, args, dtype):
+def run_mode(mode, direction, indices_cpu, args, dtype, start_dim=None):
     os.environ["SGLANG_HICACHE_HUGEPAGE_MODE"] = mode
-    sec, nbytes = bench_direction(direction, indices_cpu, args, dtype, args.layers, args.width)
+    sec, nbytes = bench_direction(direction, indices_cpu, args, dtype, args.layers, args.width, start_dim)
     gbps = nbytes / sec / 1e9
+    active = BLOCK_DIM - start_dim if start_dim is not None else BLOCK_DIM - 62
+    cores = f" cores={active:<2}" if start_dim is not None else ""
     print(
-        f"  mode={mode:<5} dir={'H2D' if direction == 1 else 'D2H'}  "
+        f"  mode={mode:<5} dir={'H2D' if direction == 1 else 'D2H'}{cores}  "
         f"moved={nbytes / 1e6:.1f}MB  {sec * 1e3:.3f} ms/iter  {gbps:.2f} GB/s"
     )
     return gbps
@@ -149,6 +161,10 @@ def main():
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     dirs = [KV_EXCHANGE_DIRECTION_H2D if d == "h2d" else KV_EXCHANGE_DIRECTION_D2H
             for d in args.directions.split(",") if d.strip()]
+    if args.start_dims.strip():
+        start_dims = [int(s) for s in args.start_dims.split(",") if s.strip()]
+    else:
+        start_dims = [None]
 
     print(
         f"kv_exchange bench: pool={args.pool_pages} pages, transfer={args.pages} pages, "
@@ -156,20 +172,23 @@ def main():
         f"iters={args.iters}, block_dim={BLOCK_DIM}"
     )
     results = {}
-    for mode in modes:
-        for direction in dirs:
-            results[(mode, direction)] = run_mode(mode, direction, indices_cpu, args, dtype)
+    for sd in start_dims:
+        for mode in modes:
+            for direction in dirs:
+                results[(sd, mode, direction)] = run_mode(mode, direction, indices_cpu, args, dtype, sd)
 
     print("\n==== hugepage A/B summary (GB/s) ====")
-    header_modes = [m for m in modes]
-    for direction in dirs:
-        cells = "  ".join(f"{m}: {results[(m, direction)]:8.2f}" for m in header_modes)
-        print(f"  {'H2D' if direction == 1 else 'D2H'}: {cells}")
-        base = results.get(("off", direction))
-        if base:
-            for m in header_modes:
-                if m != "off":
-                    print(f"    {m} vs off: {results[(m, direction)] / base:.2f}x")
+    for sd in start_dims:
+        tag = f"start_dim={sd} (cores={BLOCK_DIM - sd})" if sd is not None else "default (cores=2)"
+        print(f"  ---- {tag} ----")
+        for direction in dirs:
+            cells = "  ".join(f"{m}: {results[(sd, m, direction)]:8.2f}" for m in modes)
+            print(f"  {'H2D' if direction == 1 else 'D2H'}: {cells}")
+            base = results.get((sd, "off", direction))
+            if base:
+                for m in modes:
+                    if m != "off":
+                        print(f"    {m} vs off: {results[(sd, m, direction)] / base:.2f}x")
 
 
 if __name__ == "__main__":

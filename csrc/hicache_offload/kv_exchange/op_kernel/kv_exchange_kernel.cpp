@@ -85,15 +85,25 @@ public:
         aivNum_ = AscendC::GetBlockNum();
         aivIndex_ = AscendC::GetBlockIdx();
 
-        if (aivIndex_ < KV_EXCHANGE_START_DIM) {
+        metaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(meta), KV_EXCHANGE_META_SIZE);
+
+        // Active-core window: cores [startDim, blockDim) participate. meta[7]
+        // (reserved) overrides KV_EXCHANGE_START_DIM so the participating core
+        // count can be swept without recompiling; 0 keeps the MemFabric
+        // default (62, i.e. 2 active cores on Ascend950).
+        startDim_ = metaGm_.GetValue(7);
+        if (startDim_ <= 0) {
+            startDim_ = KV_EXCHANGE_START_DIM;
+        }
+
+        if (aivIndex_ < startDim_) {
             skip_ = true;
             return;
         }
 
-        aivIndex_ = aivIndex_ - KV_EXCHANGE_START_DIM;
-        aivNum_ = aivNum_ - KV_EXCHANGE_START_DIM;
+        aivIndex_ = aivIndex_ - startDim_;
+        aivNum_ = aivNum_ - startDim_;
 
-        metaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t *>(meta), KV_EXCHANGE_META_SIZE);
         numComponents_ = static_cast<int32_t>(metaGm_.GetValue(0));
         numPages_ = metaGm_.GetValue(1);
         pageSize_ = metaGm_.GetValue(2);
@@ -468,6 +478,7 @@ private:
     int64_t numPages_ = 0;
     int64_t pageSize_ = 0;
     int64_t direction_ = 0;
+    int64_t startDim_ = KV_EXCHANGE_START_DIM;
     int32_t hostLayoutMode_ = HOST_LAYOUT_PAGE_FIRST;
     uint32_t aivIndex_ = 0;
     uint32_t aivNum_ = 0;

@@ -5,7 +5,7 @@ import ctypes
 import logging
 import os
 from math import prod
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 # meta layout (int64 values, see kv_exchange_kernel.cpp):
 #   header: 8 values, per component: 9 values, at most 4 components.
+#   header[7] = start_dim override: cores [start_dim, block_dim) participate;
+#   0 keeps the MemFabric default (62 -> 2 active AIV cores on Ascend950).
 KV_EXCHANGE_META_HEADER = 8
 KV_EXCHANGE_META_STRIDE = 9
 KV_EXCHANGE_MAX_COMPONENTS = 4
@@ -140,12 +142,18 @@ def build_kv_exchange_meta(
     host_indices_ptr: int,
     host_layout_mode: int,
     components: Sequence[Sequence[int]],
+    start_dim: Optional[int] = None,
 ) -> List[int]:
     """Assemble the full 44-value meta vector consumed by ``kv_exchange``.
 
     ``components`` is a sequence of :func:`build_kv_exchange_component`
     outputs; at most 4 are accepted. Padding values are appended so the meta
     tensor always has ``KV_EXCHANGE_META_NUMEL`` elements.
+
+    ``start_dim`` overrides which AIV cores participate (cores
+    ``[start_dim, block_dim)``; active cores = ``block_dim - start_dim``).
+    ``None`` reads ``SGLANG_KV_EXCHANGE_START_DIM``; the effective 0 keeps the
+    MemFabric default of 62 (2 active cores on Ascend950).
     """
     if not 0 < len(components) <= KV_EXCHANGE_MAX_COMPONENTS:
         raise ValueError(f"expected 1..{KV_EXCHANGE_MAX_COMPONENTS} components, got {len(components)}")
@@ -157,6 +165,9 @@ def build_kv_exchange_meta(
         if len(comp) != KV_EXCHANGE_META_STRIDE:
             raise ValueError(f"each component must have {KV_EXCHANGE_META_STRIDE} values, got {len(comp)}")
 
+    if start_dim is None:
+        start_dim = int(os.environ.get("SGLANG_KV_EXCHANGE_START_DIM", "0") or 0)
+
     meta = [
         len(components),
         int(num_pages),
@@ -165,7 +176,7 @@ def build_kv_exchange_meta(
         int(device_indices_ptr),
         int(host_indices_ptr),
         int(host_layout_mode),
-        0,  # reserved
+        int(start_dim),
     ]
     for comp in components:
         meta.extend(int(v) for v in comp)
