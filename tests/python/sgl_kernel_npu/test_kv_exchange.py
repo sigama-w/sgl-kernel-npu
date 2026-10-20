@@ -1,4 +1,4 @@
-import unittest
+giimport unittest
 
 import sgl_kernel_npu  # noqa: F401
 import torch
@@ -50,21 +50,26 @@ class TestKvExchange(unittest.TestCase):
         device_v = torch.zeros(device_shape, dtype=dtype, device="npu")
 
         # Distinct per (layer, page) values so wrong strides/offsets fail.
+        # Logical values are built in the DEVICE layout [layer, page, ...];
+        # the page-first host expectation is a transposed view of the same
+        # logical data.
         base = (
             torch.arange(layers * num_pages, dtype=torch.float32)
             .add_(1.0)
             .view(layers, num_pages)
         )
-        src_k = torch.empty(host_shape, dtype=dtype)
-        src_v = torch.empty(host_shape, dtype=dtype)
+        src_k = torch.empty(device_shape, dtype=dtype)
+        src_v = torch.empty(device_shape, dtype=dtype)
         for layer in range(layers):
             for page in range(num_pages):
                 val = base[layer][page].item()
-                src_k[page, layer] = val
-                src_v[page, layer] = val * 2
+                src_k[layer, page] = val
+                src_v[layer, page] = val * 2
+        src_k_host = src_k.permute(1, 0, 2, 3, 4).contiguous()
+        src_v_host = src_v.permute(1, 0, 2, 3, 4).contiguous()
         if direction == KV_EXCHANGE_DIRECTION_H2D:
-            host_k.copy_(src_k)
-            host_v.copy_(src_v)
+            host_k.copy_(src_k_host)
+            host_v.copy_(src_v_host)
         else:
             device_k.copy_(src_k.to("npu"))
             device_v.copy_(src_v.to("npu"))
@@ -137,29 +142,28 @@ class TestKvExchange(unittest.TestCase):
         kv_exchange(meta, block_dim=BLOCK_DIM)
         torch.npu.synchronize()
 
-        expect_k = src_k.to("npu")
-        expect_v = src_v.to("npu")
         if direction == KV_EXCHANGE_DIRECTION_H2D:
             self.assertTrue(
-                torch.equal(device_k, expect_k),
+                torch.equal(device_k, src_k.to("npu")),
                 "device k must equal host k after H2D",
             )
             self.assertTrue(
-                torch.equal(device_v, expect_v),
+                torch.equal(device_v, src_v.to("npu")),
                 "device v must equal host v after H2D",
             )
         else:
+            # Pure-CPU compare against the page-first expectation.
             self.assertTrue(
-                torch.equal(host_k.to("npu"), expect_k),
+                torch.equal(host_k, src_k_host),
                 "host k must equal device k after D2H",
             )
             self.assertTrue(
-                torch.equal(host_v.to("npu"), expect_v),
+                torch.equal(host_v, src_v_host),
                 "host v must equal device v after D2H",
             )
         if num_components == 4:
             self.assertEqual(
-                empty_host.to("npu").abs().sum().item(),
+                empty_host.abs().sum().item(),
                 0,
                 "empty component must transfer nothing",
             )
