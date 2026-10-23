@@ -88,10 +88,10 @@ case "${DTYPE}" in
     *)       ELEM=2 ;;
 esac
 
-# bench 的 host 缓冲按整池分配: pool_bytes = POOL x LAYERS x PAGE_SIZE x 2组件 x WIDTH x elem。
-# 大层数 + 大池会超过物理内存, 按预算钳制 (带宽只取决于传输页数, 池大小不影响结果,
-# 只影响索引散布范围)。
-HOST_BUDGET_GB=${HOST_BUDGET_GB:-8}
+# bench 的 host/device 池缓冲都按整池分配: pool_bytes = POOL x LAYERS x PAGE_SIZE x 2组件 x WIDTH x elem。
+# 大层数 + 大池会超过物理内存/HBM, 按预算钳制 (带宽只取决于传输页数, 池大小不影响结果,
+# 只影响索引散布范围)。预算同时约束 host DRAM 和 device HBM 两侧 (缓冲等大), 留足运行时余量。
+HOST_BUDGET_GB=${HOST_BUDGET_GB:-4}
 PAGE_HOST_BYTES=$(( LAYERS * PAGE_SIZE * 2 * WIDTH * ELEM ))
 MAX_POOL=$(( HOST_BUDGET_GB * 1073741824 / PAGE_HOST_BYTES ))
 if [ "${POOL_PAGES}" -gt "${MAX_POOL}" ]; then

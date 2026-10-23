@@ -22,6 +22,7 @@ import torch
 
 import sgl_kernel_npu  # noqa: F401
 from sgl_kernel_npu.hicache_offload import (
+    HOST_LAYOUT_LAYER_FIRST,
     HOST_LAYOUT_PAGE_FIRST,
     KV_EXCHANGE_DIRECTION_D2H,
     KV_EXCHANGE_DIRECTION_H2D,
@@ -30,6 +31,8 @@ from sgl_kernel_npu.hicache_offload import (
     free_hugepage_all,
     kv_exchange,
 )
+
+HOST_LAYOUTS = {"page_first": HOST_LAYOUT_PAGE_FIRST, "layer_first": HOST_LAYOUT_LAYER_FIRST}
 
 BLOCK_DIM = 64  # Ascend950: cores 62/63 participate
 
@@ -46,6 +49,12 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--modes", type=str, default="auto,off", help="comma list: auto / 1g / 2m / off")
     p.add_argument("--directions", type=str, default="h2d,d2h")
+    p.add_argument(
+        "--host-layouts",
+        type=str,
+        default="page_first,layer_first",
+        help="comma list of host pool layouts to benchmark: page_first / layer_first",
+    )
     p.add_argument(
         "--start-dims",
         type=str,
@@ -65,14 +74,19 @@ def make_host_buffer(shape, dtype):
     return tensor, host_ptr, dev_ptr
 
 
-def bench_direction(direction, indices_cpu, args, dtype, layers, width, start_dim=None):
+def bench_direction(direction, indices_cpu, args, dtype, layers, width, host_layout, start_dim=None):
     """Returns (seconds_per_iter, bytes_moved_per_iter)."""
     device = "npu"
     pool_pages, pages, page_size = args.pool_pages, args.pages, args.page_size
 
-    # Both pools cover the full pool; the indices select which pages move
-    # (same as the sglang host pool).
-    host_shape = (pool_pages, layers, page_size, 1, width)
+    # The host pool mirrors the selected layout; the device pool is always
+    # layer-first (same as the sglang host pool and device KV cache).
+    if host_layout == HOST_LAYOUT_LAYER_FIRST:
+        host_shape = (layers, pool_pages, page_size, 1, width)
+        host_page_axis, host_layer_axis = 1, 0
+    else:
+        host_shape = (pool_pages, layers, page_size, 1, width)
+        host_page_axis, host_layer_axis = 0, 1
     device_shape = (layers, pool_pages, page_size, 1, width)
 
     host_k, host_k_ptr, host_k_dev = make_host_buffer(host_shape, dtype)
@@ -91,21 +105,20 @@ def bench_direction(direction, indices_cpu, args, dtype, layers, width, start_di
                 host_base=dev,
                 device_layer_pitch=(device_k if buf is host_k else device_v).stride(0) * dtype.itemsize,
                 device_page_pitch=(device_k if buf is host_k else device_v).stride(1) * dtype.itemsize,
-                host_page_pitch=buf.stride(0) * dtype.itemsize,
-                host_layer_pitch=buf.stride(1) * dtype.itemsize,
+                host_page_pitch=buf.stride(host_page_axis) * dtype.itemsize,
+                host_layer_pitch=buf.stride(host_layer_axis) * dtype.itemsize,
                 width=buf.stride(2) * dtype.itemsize * page_size,
                 layer_lo=0,
                 layer_hi=layers,
             )
         )
-
     vals = build_kv_exchange_meta(
         num_pages=pages,
         page_size=page_size,
         direction=direction,
         device_indices_ptr=device_indices.data_ptr(),
         host_indices_ptr=host_indices.data_ptr(),
-        host_layout_mode=HOST_LAYOUT_PAGE_FIRST,
+        host_layout_mode=host_layout,
         components=components,
         start_dim=start_dim,
     )
@@ -131,14 +144,15 @@ def bench_direction(direction, indices_cpu, args, dtype, layers, width, start_di
     return elapsed / args.iters, bytes_moved
 
 
-def run_mode(mode, direction, indices_cpu, args, dtype, start_dim=None):
+def run_mode(mode, direction, indices_cpu, args, dtype, host_layout, start_dim=None):
     os.environ["SGLANG_HICACHE_HUGEPAGE_MODE"] = mode
-    sec, nbytes = bench_direction(direction, indices_cpu, args, dtype, args.layers, args.width, start_dim)
+    sec, nbytes = bench_direction(direction, indices_cpu, args, dtype, args.layers, args.width, host_layout, start_dim)
     gbps = nbytes / sec / 1e9
     active = BLOCK_DIM - start_dim if start_dim is not None else BLOCK_DIM - 62
     cores = f" cores={active:<2}" if start_dim is not None else ""
+    layout = "layerF" if host_layout == HOST_LAYOUT_LAYER_FIRST else "pageF "
     print(
-        f"  mode={mode:<5} dir={'H2D' if direction == 1 else 'D2H'}{cores}  "
+        f"  mode={mode:<5} dir={'H2D' if direction == 1 else 'D2H'} host={layout}{cores}  "
         f"moved={nbytes / 1e6:.1f}MB  {sec * 1e3:.3f} ms/iter  {gbps:.2f} GB/s"
     )
     return gbps
@@ -161,6 +175,14 @@ def main():
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     dirs = [KV_EXCHANGE_DIRECTION_H2D if d == "h2d" else KV_EXCHANGE_DIRECTION_D2H
             for d in args.directions.split(",") if d.strip()]
+    layouts = []
+    for name in args.host_layouts.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if name not in HOST_LAYOUTS:
+            raise SystemExit(f"unknown host layout: {name} (choose from {list(HOST_LAYOUTS)})")
+        layouts.append(HOST_LAYOUTS[name])
     if args.start_dims.strip():
         start_dims = [int(s) for s in args.start_dims.split(",") if s.strip()]
     else:
@@ -169,26 +191,30 @@ def main():
     print(
         f"kv_exchange bench: pool={args.pool_pages} pages, transfer={args.pages} pages, "
         f"page_size={args.page_size}, width={args.width}, layers={args.layers}, dtype={args.dtype}, "
-        f"iters={args.iters}, block_dim={BLOCK_DIM}"
+        f"iters={args.iters}, block_dim={BLOCK_DIM}, host_layouts={[l for l in args.host_layouts.split(',') if l.strip()]}"
     )
     results = {}
     for sd in start_dims:
-        for mode in modes:
-            for direction in dirs:
-                results[(sd, mode, direction)] = run_mode(mode, direction, indices_cpu, args, dtype, sd)
+        for layout in layouts:
+            for mode in modes:
+                for direction in dirs:
+                    results[(sd, layout, mode, direction)] = run_mode(mode, direction, indices_cpu, args, dtype, layout, sd)
 
+    layout_names = {v: k for k, v in HOST_LAYOUTS.items()}
     print("\n==== hugepage A/B summary (GB/s) ====")
     for sd in start_dims:
         tag = f"start_dim={sd} (cores={BLOCK_DIM - sd})" if sd is not None else "default (cores=2)"
         print(f"  ---- {tag} ----")
-        for direction in dirs:
-            cells = "  ".join(f"{m}: {results[(sd, m, direction)]:8.2f}" for m in modes)
-            print(f"  {'H2D' if direction == 1 else 'D2H'}: {cells}")
-            base = results.get((sd, "off", direction))
-            if base:
-                for m in modes:
-                    if m != "off":
-                        print(f"    {m} vs off: {results[(sd, m, direction)] / base:.2f}x")
+        for layout in layouts:
+            print(f"  host={layout_names[layout]}:")
+            for direction in dirs:
+                cells = "  ".join(f"{m}: {results[(sd, layout, m, direction)]:8.2f}" for m in modes)
+                print(f"    {'H2D' if direction == 1 else 'D2H'}: {cells}")
+                base = results.get((sd, layout, "off", direction))
+                if base:
+                    for m in modes:
+                        if m != "off":
+                            print(f"      {m} vs off: {results[(sd, layout, m, direction)] / base:.2f}x")
 
 
 if __name__ == "__main__":
