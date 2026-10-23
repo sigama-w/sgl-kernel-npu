@@ -1,0 +1,185 @@
+/*
+ * AICPU device-side kernel for sgl-kernel-npu KV exchange (hicache offload).
+ *
+ * Moves KV pages between device HBM and host-pinned memory that has been
+ * registered with aclrtHostRegister (device-side DVA). Both sides of every
+ * copy are device-visible addresses, so the AICPU core can memcpy directly.
+ *
+ * The kernel mirrors the memfabric_hybrid AICPU kernel style: a bare
+ * extern "C" function with no external linkage dependencies, cross-compiled
+ * as a shared library and loaded via aclrtBinaryLoadFromFile(json).
+ *
+ * Launch contract (host side, see aicpu_launcher.cpp):
+ *   - single parameter: KvExchangeAicpuParam* appended by AclrtKernelArgsAppend
+ *   - blockDim = 1 (all work is done in one AICPU core)
+ *
+ * meta layout (44 int64 slots, by value inside the param struct):
+ *   [0] num_components        1..4 (e.g. K and V count as 2)
+ *   [1] num_indices           number of token slots to copy
+ *   [2] page_size             tokens per page
+ *   [3] direction             1 = H2D, 2 = D2H
+ *   [4] device_indices_ptr    DVA of int64 token indices into device cache
+ *   [5] host_indices_ptr      DVA of int64 token indices into host cache
+ *   [6] host_layout_mode      0 = page_first, 1 = layer_first
+ *   [7] reserved              must be 0
+ *   per component c (base = 8 + 9*c):
+ *   +0 device_base            DVA of the device KV tensor for this component
+ *   +1 host_base              DVA of the registered host KV tensor
+ *   +2 device_layer_pitch     bytes between consecutive layers (device)
+ *   +3 device_page_pitch      bytes between consecutive pages (device)
+ *   +4 host_page_pitch        bytes between consecutive pages (host)
+ *   +5 host_layer_pitch       bytes between consecutive layers (host)
+ *   +6 width                  bytes of one full page row (page_size tokens)
+ *   +7 layer_lo               first layer owned by this component (inclusive)
+ *   +8 layer_hi               last layer owned by this component (exclusive)
+ */
+
+#include <cstdint>
+#include <cstring>
+
+namespace {
+
+constexpr int kMetaSlots = 44;
+constexpr int64_t kMaxComponents = 4;
+constexpr int64_t kMaxLayers = 1LL << 20;
+
+// meta header slot offsets
+constexpr int kMetaNumComponents = 0;
+constexpr int kMetaNumIndices = 1;
+constexpr int kMetaPageSize = 2;
+constexpr int kMetaDirection = 3;
+constexpr int kMetaDeviceIndicesPtr = 4;
+constexpr int kMetaHostIndicesPtr = 5;
+constexpr int kMetaHostLayoutMode = 6;
+
+// per-component slot offsets
+constexpr int kCompStride = 9;
+constexpr int kCompDeviceBase = 0;
+constexpr int kCompHostBase = 1;
+constexpr int kCompDeviceLayerPitch = 2;
+constexpr int kCompDevicePagePitch = 3;
+constexpr int kCompHostPagePitch = 4;
+constexpr int kCompHostLayerPitch = 5;
+constexpr int kCompWidth = 6;
+constexpr int kCompLayerLo = 7;
+constexpr int kCompLayerHi = 8;
+
+constexpr int64_t kDirectionH2D = 1;
+constexpr int64_t kDirectionD2H = 2;
+constexpr int64_t kLayoutPageFirst = 0;
+constexpr int64_t kLayoutLayerFirst = 1;
+
+// error codes (kept non-zero and coarse; host side only needs pass/fail)
+constexpr int32_t kRetOk = 0;
+constexpr int32_t kRetInvalidParam = 1;
+constexpr int32_t kRetCopyFailed = 2;
+
+} // namespace
+
+struct KvExchangeAicpuParam {
+    int64_t meta[kMetaSlots];
+};
+
+extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
+{
+    if (param == nullptr) {
+        return kRetInvalidParam;
+    }
+    const int64_t *meta = param->meta;
+
+    const int64_t numComponents = meta[kMetaNumComponents];
+    const int64_t numIndices = meta[kMetaNumIndices];
+    const int64_t pageSize = meta[kMetaPageSize];
+    const int64_t direction = meta[kMetaDirection];
+    const int64_t hostLayoutMode = meta[kMetaHostLayoutMode];
+
+    if (numComponents <= 0 || numComponents > kMaxComponents) {
+        return kRetInvalidParam;
+    }
+    if (numIndices < 0) {
+        return kRetInvalidParam;
+    }
+    if (pageSize <= 0) {
+        return kRetInvalidParam;
+    }
+    if (direction != kDirectionH2D && direction != kDirectionD2H) {
+        return kRetInvalidParam;
+    }
+    if (hostLayoutMode != kLayoutPageFirst && hostLayoutMode != kLayoutLayerFirst) {
+        return kRetInvalidParam;
+    }
+
+    const int64_t *deviceIndices = reinterpret_cast<const int64_t *>(meta[kMetaDeviceIndicesPtr]);
+    const int64_t *hostIndices = reinterpret_cast<const int64_t *>(meta[kMetaHostIndicesPtr]);
+    if (numIndices > 0 && (deviceIndices == nullptr || hostIndices == nullptr)) {
+        return kRetInvalidParam;
+    }
+
+    // per-component sanity + precomputed fields
+    uint8_t *deviceBase[kMaxComponents] = {};
+    uint8_t *hostBase[kMaxComponents] = {};
+    int64_t deviceLayerPitch[kMaxComponents] = {};
+    int64_t devicePagePitch[kMaxComponents] = {};
+    int64_t hostPagePitch[kMaxComponents] = {};
+    int64_t hostLayerPitch[kMaxComponents] = {};
+    int64_t tokenBytes[kMaxComponents] = {};
+    int64_t layerLo[kMaxComponents] = {};
+    int64_t layerHi[kMaxComponents] = {};
+
+    for (int64_t c = 0; c < numComponents; ++c) {
+        const int64_t *comp = meta + 8 + c * kCompStride;
+        const int64_t width = comp[kCompWidth];
+        layerLo[c] = comp[kCompLayerLo];
+        layerHi[c] = comp[kCompLayerHi];
+        if (width <= 0 || width % pageSize != 0) {
+            return kRetInvalidParam;
+        }
+        if (layerLo[c] < 0 || layerHi[c] < layerLo[c] || layerHi[c] > kMaxLayers) {
+            return kRetInvalidParam;
+        }
+        deviceBase[c] = reinterpret_cast<uint8_t *>(comp[kCompDeviceBase]);
+        hostBase[c] = reinterpret_cast<uint8_t *>(comp[kCompHostBase]);
+        deviceLayerPitch[c] = comp[kCompDeviceLayerPitch];
+        devicePagePitch[c] = comp[kCompDevicePagePitch];
+        hostPagePitch[c] = comp[kCompHostPagePitch];
+        hostLayerPitch[c] = comp[kCompHostLayerPitch];
+        tokenBytes[c] = width / pageSize;
+        if (deviceBase[c] == nullptr || hostBase[c] == nullptr) {
+            return kRetInvalidParam;
+        }
+    }
+
+    for (int64_t i = 0; i < numIndices; ++i) {
+        const int64_t devTok = deviceIndices[i];
+        const int64_t hostTok = hostIndices[i];
+        if (devTok < 0 || hostTok < 0) {
+            return kRetInvalidParam;
+        }
+        const int64_t devPage = devTok / pageSize;
+        const int64_t devIntra = devTok % pageSize;
+        const int64_t hostPage = hostTok / pageSize;
+        const int64_t hostIntra = hostTok % pageSize;
+
+        for (int64_t c = 0; c < numComponents; ++c) {
+            const int64_t devTokenOffset = devPage * devicePagePitch[c] + devIntra * tokenBytes[c];
+
+            for (int64_t layer = layerLo[c]; layer < layerHi[c]; ++layer) {
+                uint8_t *devAddr = deviceBase[c] + layer * deviceLayerPitch[c] + devTokenOffset;
+                uint8_t *hostAddr;
+                if (hostLayoutMode == kLayoutPageFirst) {
+                    hostAddr = hostBase[c] + hostPage * hostPagePitch[c] + layer * hostLayerPitch[c] +
+                               hostIntra * tokenBytes[c];
+                } else {
+                    hostAddr = hostBase[c] + layer * hostLayerPitch[c] + hostPage * hostPagePitch[c] +
+                               hostIntra * tokenBytes[c];
+                }
+                uint8_t *dst = direction == kDirectionH2D ? devAddr : hostAddr;
+                const uint8_t *src = direction == kDirectionH2D ? hostAddr : devAddr;
+                if (memcpy(dst, src, static_cast<size_t>(tokenBytes[c])) != dst) {
+                    return kRetCopyFailed;
+                }
+            }
+        }
+    }
+    return kRetOk;
+}

@@ -15,6 +15,7 @@
 
 #include "torch_helper.h"
 #include "sgl_kenel_npu_ops.h"
+#include "aicpu_launcher.h"
 #include "causal_conv1d_update/op_host/causal_conv1d_update.h"
 #include "causal_conv1d/op_host/causal_conv1d.h"
 
@@ -55,6 +56,13 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def(
         "transfer_mamba_state(Tensor device_buf, Tensor host_buf, "
         "Tensor device_indices, Tensor host_indices, int direction) -> ()");
+
+    // Control-plane ops for the AICPU kv_exchange backend: meta is a CPU int64[44]
+    // descriptor whose pointer slots hold DVAs (device bases, host bases returned by
+    // aclrt_host_register, index tensor data pointers).
+    m.def("kv_exchange_aicpu(Tensor meta) -> ()");
+    m.def("aclrt_host_register(Tensor buf) -> int");
+    m.def("aclrt_host_unregister(Tensor buf) -> ()");
 
     m.def(
         "transfer_state_per_layer_direct_pf_lf(Tensor src, Tensor dst, "
@@ -416,5 +424,16 @@ namespace {
 TORCH_LIBRARY_IMPL(npu, CPU, m)
 {
     m.impl("sparse_attn_sharedkv_metadata_host", TORCH_FN(sglang::npu_kernel::sparse_attn_sharedkv_metadata_host));
+}
+}  // namespace
+
+namespace {
+// AICPU kv_exchange control-plane ops take only CPU tensors, so backend
+// dispatch cannot infer PrivateUse1 from their inputs.
+TORCH_LIBRARY_IMPL(npu, CatchAll, m)
+{
+    m.impl("kv_exchange_aicpu", TORCH_FN(sglang::npu_kernel::kv_exchange_aicpu));
+    m.impl("aclrt_host_register", TORCH_FN(sglang::npu_kernel::aclrt_host_register));
+    m.impl("aclrt_host_unregister", TORCH_FN(sglang::npu_kernel::aclrt_host_unregister));
 }
 }  // namespace

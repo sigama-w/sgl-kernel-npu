@@ -1,0 +1,9 @@
+{
+    "KvExchangeAicpu": {
+        "opInfo": {
+            "functionName": "KvExchangeAicpu",
+            "kernelSo": "libcann_kv_exchange_kernel.so",
+            "opKernelLib": "AICPUKernel"
+        }
+    }
+}
