@@ -39,6 +39,7 @@ except ImportError:
     HAS_OPS = False
 
 DTYPE = torch.bfloat16
+ELEM_SIZE = 2  # bytes per bf16 element (torch.dtype has no element_size attr)
 H2D, D2H = 1, 2
 PAGE_FIRST, LAYER_FIRST = 0, 1
 
@@ -80,17 +81,17 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
 
     # Geometry: one component per K/V tensor, device cache is layer-major
     # [layers, tokens, head_dim]; host cache layout depends on host_layout_mode.
-    token_bytes = page_size * head_dim * DTYPE.element_size  # width per page row
+    token_bytes = page_size * head_dim * ELEM_SIZE  # width per page row
     width = token_bytes
-    dev_layer_pitch = num_tokens_dev * head_dim * DTYPE.element_size
-    dev_page_pitch = head_dim * DTYPE.element_size
+    dev_layer_pitch = num_tokens_dev * head_dim * ELEM_SIZE
+    dev_page_pitch = head_dim * ELEM_SIZE
     if layout == PAGE_FIRST:
-        host_page_pitch = num_layers * head_dim * DTYPE.element_size
-        host_layer_pitch = head_dim * DTYPE.element_size
+        host_page_pitch = num_layers * head_dim * ELEM_SIZE
+        host_layer_pitch = head_dim * ELEM_SIZE
         host_shape = (num_tokens_host, num_layers, head_dim)
     else:
-        host_page_pitch = head_dim * DTYPE.element_size
-        host_layer_pitch = num_tokens_host * head_dim * DTYPE.element_size
+        host_page_pitch = head_dim * ELEM_SIZE
+        host_layer_pitch = num_tokens_host * head_dim * ELEM_SIZE
         host_shape = (num_layers, num_tokens_host, head_dim)
     dev_shape = (num_layers, num_tokens_dev, head_dim)
 
