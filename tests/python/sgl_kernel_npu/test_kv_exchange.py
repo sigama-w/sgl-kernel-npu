@@ -1,4 +1,4 @@
-giimport unittest
+import unittest
 
 import sgl_kernel_npu  # noqa: F401
 import torch
