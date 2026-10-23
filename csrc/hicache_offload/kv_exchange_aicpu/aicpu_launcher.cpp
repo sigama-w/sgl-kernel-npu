@@ -12,21 +12,26 @@
 #include "aicpu_launcher.h"
 
 #include <dlfcn.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+
+#include <acl/acl.h>
+#include <driver/ascend_hal_define.h>
 
 namespace sglang {
 namespace npu_kernel {
 
 namespace {
 
-using aclError = int32_t;
 using aclrtBinHandle = void *;
 using aclrtFuncHandle = void *;
 using aclrtArgsHandle = void *;
@@ -102,8 +107,6 @@ using aclrtKernelArgsAppendFunc = int32_t (*)(aclrtArgsHandle, void *, size_t, a
 using aclrtKernelArgsFinalizeFunc = int32_t (*)(aclrtArgsHandle);
 using aclrtLaunchKernelWithConfigFunc = int32_t (*)(aclrtFuncHandle, uint32_t, void *, aclrtLaunchKernelCfg *,
                                                     aclrtArgsHandle, void *);
-using aclrtHostRegisterFunc = int32_t (*)(void *, size_t, void **);
-using aclrtHostUnregisterFunc = int32_t (*)(void *);
 
 // Must match struct KvExchangeAicpuParam in kv_exchange_aicpu_kernel.cc.
 constexpr size_t kMetaSlots = 44;
@@ -123,8 +126,6 @@ struct AicpuLaunchApi {
     aclrtKernelArgsAppendFunc kernelArgsAppend = nullptr;
     aclrtKernelArgsFinalizeFunc kernelArgsFinalize = nullptr;
     aclrtLaunchKernelWithConfigFunc launchKernelWithConfig = nullptr;
-    aclrtHostRegisterFunc hostRegister = nullptr;
-    aclrtHostUnregisterFunc hostUnregister = nullptr;
 };
 
 void *DlsymRequired(const char *name)
@@ -146,8 +147,6 @@ const AicpuLaunchApi &GetApi()
         a.kernelArgsFinalize = reinterpret_cast<aclrtKernelArgsFinalizeFunc>(DlsymRequired("aclrtKernelArgsFinalize"));
         a.launchKernelWithConfig =
             reinterpret_cast<aclrtLaunchKernelWithConfigFunc>(DlsymRequired("aclrtLaunchKernelWithConfig"));
-        a.hostRegister = reinterpret_cast<aclrtHostRegisterFunc>(DlsymRequired("aclrtHostRegister"));
-        a.hostUnregister = reinterpret_cast<aclrtHostUnregisterFunc>(DlsymRequired("aclrtHostUnregister"));
         return a;
     }();
     return api;
@@ -250,23 +249,130 @@ void kv_exchange_aicpu(const at::Tensor &meta)
     TORCH_CHECK(ret == 0, "kv_exchange_aicpu: AclrtLaunchKernelWithConfig failed, ret=", ret);
 }
 
+// Host registration, mirroring LMCache-Ascend managed_mem.cpp:
+//   primary  : aclrtHostRegister(ptr, size, ACL_HOST_REGISTER_MAPPED, &devPtr)
+//              (driver >= 25.0 pins the pages internally)
+//   fallback : halHostRegister(ptr, size, flag, devid, &devPtr) + explicit mlock
+// NOTE: aclrtHostRegister takes FOUR arguments -- omitting the register type
+// misaligns parameters and fails with ret=207000.
+extern "C" {
+drvError_t halHostRegister(void *srcPtr, UINT64 size, UINT32 flag, UINT32 devid, void **dstPtr);
+drvError_t halHostUnregister(void *srcPtr, UINT32 devid);
+}
+
+using aclrtHostRegisterFunc = int32_t (*)(void *, uint64_t, int32_t, void **);
+using aclrtHostUnregisterFunc = int32_t (*)(void *);
+
+#ifndef ACL_HOST_REGISTER_MAPPED
+#define ACL_HOST_REGISTER_MAPPED 1
+#endif
+
+namespace {
+
+struct HostRegApi {
+    aclrtHostRegisterFunc aclRegister = nullptr;
+    aclrtHostUnregisterFunc aclUnregister = nullptr;
+};
+
+const HostRegApi &GetHostRegApi()
+{
+    static HostRegApi api = []() {
+        HostRegApi a{};
+        // Optional: fall back to HAL if the aclrt entry is absent/fails.
+        a.aclRegister = reinterpret_cast<aclrtHostRegisterFunc>(dlsym(RTLD_DEFAULT, "aclrtHostRegister"));
+        a.aclUnregister = reinterpret_cast<aclrtHostUnregisterFunc>(dlsym(RTLD_DEFAULT, "aclrtHostUnregister"));
+        return a;
+    }();
+    return api;
+}
+
+std::mutex g_hal_reg_mu;
+std::unordered_set<void *> g_hal_registered;  // host ptrs registered via HAL
+
+UINT32 HostRegisterFlag()
+{
+    // Mirror shm_allocator's SoC detection: A3 (Ascend910_93) uses SVM map,
+    // everything else (incl. A5/Ascend950) uses PCIe throughput map.
+    const char *soc = std::getenv("SOC_VERSION");
+    if (soc == nullptr) {
+        soc = std::getenv("ASCEND_SOC_VERSION");
+    }
+    if (soc != nullptr) {
+        const std::string soc_name(soc);
+        if (soc_name.rfind("Ascend910_93", 0) == 0 || soc_name.rfind("910_93", 0) == 0) {
+            return HOST_SVM_MAP_DEV;
+        }
+    }
+    return HOST_MEM_MAP_DEV_PCIE_TH;
+}
+
+int32_t CurrentDeviceId()
+{
+    int32_t device_id = -1;
+    const aclError ret = aclrtGetDevice(&device_id);
+    TORCH_CHECK(ret == ACL_ERROR_NONE && device_id >= 0,
+                "kv_exchange_aicpu: aclrtGetDevice failed, ret=", static_cast<int32_t>(ret));
+    return device_id;
+}
+
+}  // namespace
+
 int64_t aclrt_host_register(const at::Tensor &buf)
 {
     TORCH_CHECK(buf.is_cpu(), "aclrt_host_register: buf must be host (CPU) memory");
     TORCH_CHECK(buf.nbytes() > 0, "aclrt_host_register: buf must be non-empty");
-    const auto &api = GetApi();
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(buf.data_ptr()) % 4096 == 0,
+                "aclrt_host_register: host address must be 4K aligned, got ", buf.data_ptr());
     void *devPtr = nullptr;
-    int32_t ret = api.hostRegister(buf.data_ptr(), buf.nbytes(), &devPtr);
-    TORCH_CHECK(ret == 0, "aclrt_host_register: aclrtHostRegister failed, ret=", ret,
-                " ptr=", buf.data_ptr(), " bytes=", buf.nbytes());
+
+    // Primary path: ACL runtime API (driver pins pages internally).
+    const auto &api = GetHostRegApi();
+    if (api.aclRegister != nullptr) {
+        const int32_t ret = api.aclRegister(buf.data_ptr(), static_cast<uint64_t>(buf.nbytes()),
+                                            ACL_HOST_REGISTER_MAPPED, &devPtr);
+        if (ret == 0) {
+            return static_cast<int64_t>(reinterpret_cast<uintptr_t>(devPtr));
+        }
+        // ACL path failed (likely driver < 25.0); fall through to HAL.
+    }
+
+    // Fallback path: driver HAL + explicit mlock (driver < 25.0).
+    void *host_ptr = buf.data_ptr();
+    TORCH_CHECK(mlock(host_ptr, buf.nbytes()) == 0,
+                "aclrt_host_register: mlock failed, errno=", errno);
+    const drvError_t ret = halHostRegister(host_ptr, static_cast<UINT64>(buf.nbytes()), HostRegisterFlag(),
+                                           static_cast<UINT32>(CurrentDeviceId()), &devPtr);
+    if (ret != DRV_ERROR_NONE) {
+        munlock(host_ptr, buf.nbytes());
+        TORCH_CHECK(false, "aclrt_host_register: both aclrtHostRegister and halHostRegister failed, hal ret=",
+                    static_cast<int32_t>(ret), " ptr=", host_ptr, " bytes=", buf.nbytes());
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_hal_reg_mu);
+        g_hal_registered.insert(host_ptr);
+    }
     return static_cast<int64_t>(reinterpret_cast<uintptr_t>(devPtr));
 }
 
 void aclrt_host_unregister(const at::Tensor &buf)
 {
     TORCH_CHECK(buf.is_cpu(), "aclrt_host_unregister: buf must be host (CPU) memory");
-    const auto &api = GetApi();
-    int32_t ret = api.hostUnregister(buf.data_ptr());
+    void *host_ptr = buf.data_ptr();
+    bool via_hal = false;
+    {
+        std::lock_guard<std::mutex> lock(g_hal_reg_mu);
+        via_hal = g_hal_registered.erase(host_ptr) > 0;
+    }
+    if (via_hal) {
+        const drvError_t ret = halHostUnregister(host_ptr, static_cast<UINT32>(CurrentDeviceId()));
+        munlock(host_ptr, buf.nbytes());
+        TORCH_CHECK(ret == DRV_ERROR_NONE, "aclrt_host_unregister: halHostUnregister failed, ret=",
+                    static_cast<int32_t>(ret));
+        return;
+    }
+    const auto &api = GetHostRegApi();
+    TORCH_CHECK(api.aclUnregister != nullptr, "aclrt_host_unregister: aclrtHostUnregister not available");
+    const int32_t ret = api.aclUnregister(host_ptr);
     TORCH_CHECK(ret == 0, "aclrt_host_unregister: aclrtHostUnregister failed, ret=", ret);
 }
 
