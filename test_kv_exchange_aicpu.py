@@ -40,8 +40,23 @@ except ImportError:
 
 DTYPE = torch.bfloat16
 ELEM_SIZE = 2  # bytes per bf16 element (torch.dtype has no element_size attr)
+ALIGN = 2 * 1024 * 1024  # register at a 2MB-aligned host address
 H2D, D2H = 1, 2
 PAGE_FIRST, LAYER_FIRST = 0, 1
+
+
+def alloc_host_cache(shape):
+    """Allocate a plain (NOT pinned -- pin_memory memory is already page-locked
+    and aclrtHostRegister rejects re-locking) CPU buffer, and return a bf16
+    tensor view whose data_ptr is 2MB-aligned plus the holder keeping it alive."""
+    nbytes = ELEM_SIZE
+    for s in shape:
+        nbytes *= s
+    holder = torch.empty(nbytes + ALIGN, dtype=torch.uint8)
+    base = holder.data_ptr()
+    off = (-base) % ALIGN
+    view = holder[off:off + nbytes].view(DTYPE).view(*shape)
+    return view, holder
 
 
 def build_meta(num_components, num_indices, page_size, direction, layout,
@@ -100,18 +115,16 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
     host_tok_ids = torch.randperm(num_tokens_host, device=device)[:num_indices].contiguous()
 
     results = []
-    host_dvas = []
+    host_holders = []
     for _ in range(2):  # K and V
         dev_cache = torch.zeros(dev_shape, dtype=DTYPE, device=device)
+        host_buf, holder = alloc_host_cache(host_shape)
         if direction == H2D:
-            host_buf = torch.randint(1, 100, host_shape, dtype=torch.int32).to(DTYPE).cpu()
-            host_buf = host_buf.pin_memory()
+            host_buf.copy_(torch.randint(1, 100, host_shape).to(DTYPE))
         else:
-            host_buf = torch.zeros(host_shape, dtype=DTYPE).pin_memory()
             dev_cache = torch.randn(dev_shape, dtype=DTYPE, device=device).to(DTYPE)
-        host_view = host_buf  # keep a named reference; registration uses data_ptr
         dva = torch.ops.npu.aclrt_host_register(host_buf)
-        host_dvas.append((host_buf, dva))
+        host_holders.append((host_buf, holder, dva))
         results.append((dev_cache, host_buf))
 
     try:
@@ -127,13 +140,13 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
                 "layer_lo": 0,
                 "layer_hi": num_layers,
             }
-            for dev_cache, (_, dva) in zip([r[0] for r in results], [d for _, d in host_dvas])
+            for dev_cache, (_, _, dva) in zip([r[0] for r in results], host_holders)
         ]
         meta = build_meta(2, num_indices, page_size, direction, layout,
                           dev_tok_ids.data_ptr(), host_tok_ids.data_ptr(), geoms)
 
         # Keep every buffer alive across the async launch + sync.
-        keep_alive = [meta, dev_tok_ids, host_tok_ids] + [b for b, _ in host_dvas] + [r[0] for r in results]
+        keep_alive = [meta, dev_tok_ids, host_tok_ids] + [b for b, _, _ in host_holders] + [r[0] for r in results]
         torch.ops.npu.kv_exchange_aicpu(meta)
         torch.npu.synchronize()
 
@@ -155,7 +168,7 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
                     torch.testing.assert_close(got, want, msg=f"D2H mismatch layer={layer}")
         print(f"precision OK (direction={direction}, layout={layout}, page_size={page_size})")
     finally:
-        for host_buf, _ in host_dvas:
+        for host_buf, _, _ in host_holders:
             try:
                 torch.ops.npu.aclrt_host_unregister(host_buf)
             except Exception:
