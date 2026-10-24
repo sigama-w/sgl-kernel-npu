@@ -1,13 +1,18 @@
 # Self-contained correctness test for the AICPU kv_exchange backend.
 #
 # Unlike the migrated AIV path (test_kv_exchange.py), this test does NOT need the
-# hugepage host allocator: host KV buffers are plain pinned tensors registered
-# with aclrtHostRegister (via torch.ops.npu.aclrt_host_register), and the copy
-# runs inside the AICPU device kernel launched by torch.ops.npu.kv_exchange_aicpu.
+# hugepage host allocator. The copy runs inside the AICPU device kernel launched
+# by torch.ops.npu.kv_exchange_aicpu.
+#
+# IMPORTANT: the AICPU stars subsystem cannot dereference host memory through a
+# registration DVA (rtsHostRegister channel is AIV-only on current CANN); the
+# working mechanism -- the one mf's aicpu mode uses -- is passing host VIRTUAL
+# addresses (HVA) directly: the kernel reads host indices / host cache via HVA
+# and device indices / device cache via device pointers. So meta carries HVAs
+# for all host-side fields and no aclrt_host_register call is needed here.
 #
 # Prerequisites (one-time, on the NPU device):
-#   1. Rebuild sgl-kernel-npu so sgl_kernel_npu.so contains kv_exchange_aicpu /
-#      aclrt_host_register / aclrt_host_unregister.
+#   1. Rebuild sgl-kernel-npu so sgl_kernel_npu.so contains kv_exchange_aicpu.
 #   2. bash scripts/build_kv_exchange_aicpu_run.sh install
 #      (or export SGL_KV_EXCHANGE_AICPU_JSON=/path/to/libcann_kv_exchange_kernel.json)
 #
@@ -17,8 +22,8 @@
 #
 # meta layout (44 int64, must match kv_exchange_aicpu_kernel.cc):
 #   [0]=num_components [1]=num_indices [2]=page_size [3]=direction(1=H2D,2=D2H)
-#   [4]=device_indices DVA [5]=host_indices DVA [6]=host_layout_mode(0=pf,1=lf)
-#   per component c at 8+9c: dev_base, host_base(DVA), dev_layer_pitch,
+#   [4]=device_indices ptr [5]=host_indices HVA [6]=host_layout_mode(0=pf,1=lf)
+#   per component c at 8+9c: dev_base, host_base(HVA), dev_layer_pitch,
 #   dev_page_pitch, host_page_pitch, host_layer_pitch, width, layer_lo, layer_hi
 
 import pytest
@@ -46,17 +51,10 @@ PAGE_FIRST, LAYER_FIRST = 0, 1
 
 
 def alloc_host_cache(shape):
-    """Allocate a plain (NOT pinned -- pin_memory memory is already page-locked
-    and aclrtHostRegister rejects re-locking) CPU buffer, and return a bf16
-    tensor view whose data_ptr is 2MB-aligned plus the holder keeping it alive."""
-    nbytes = ELEM_SIZE
-    for s in shape:
-        nbytes *= s
-    holder = torch.empty(nbytes + ALIGN, dtype=torch.uint8)
-    base = holder.data_ptr()
-    off = (-base) % ALIGN
-    view = holder[off:off + nbytes].view(DTYPE).view(*shape)
-    return view, holder
+    """Allocate a PINNED (page-locked) CPU buffer so its pages have a stable
+    physical backing while the AICPU kernel dereferences the HVA, and return
+    the bf16 tensor view plus the holder keeping it alive."""
+    return torch.empty(shape, dtype=DTYPE, pin_memory=True), None
 
 
 def build_meta(num_components, num_indices, page_size, direction, layout,
@@ -110,9 +108,10 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
         host_shape = (num_layers, num_tokens_host, head_dim)
     dev_shape = (num_layers, num_tokens_dev, head_dim)
 
-    # Indices: distinct token ids, device and host differ on purpose.
+    # Indices: distinct token ids. Device indices live on device (read via
+    # device pointer); host indices live in pinned host memory (read via HVA).
     dev_tok_ids = torch.randperm(num_tokens_dev, device=device)[:num_indices].contiguous()
-    host_tok_ids = torch.randperm(num_tokens_host, device=device)[:num_indices].contiguous()
+    host_tok_ids = torch.randperm(num_tokens_host).pin_memory().contiguous()
 
     results = []
     host_holders = []
@@ -123,15 +122,15 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
             host_buf.copy_(torch.randint(1, 100, host_shape).to(DTYPE))
         else:
             dev_cache = torch.randn(dev_shape, dtype=DTYPE, device=device).to(DTYPE)
-        dva = torch.ops.npu.aclrt_host_register(host_buf)
-        host_holders.append((host_buf, holder, dva))
+        hva = host_buf.data_ptr()
+        host_holders.append((host_buf, holder, hva))
         results.append((dev_cache, host_buf))
 
     try:
         geoms = [
             {
                 "dev_base": dev_cache.data_ptr(),
-                "host_base": dva,
+                "host_base": hva,
                 "dev_layer_pitch": dev_layer_pitch,
                 "dev_page_pitch": dev_page_pitch,
                 "host_page_pitch": host_page_pitch,
@@ -140,7 +139,7 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
                 "layer_lo": 0,
                 "layer_hi": num_layers,
             }
-            for dev_cache, (_, _, dva) in zip([r[0] for r in results], host_holders)
+            for dev_cache, (_, _, hva) in zip([r[0] for r in results], host_holders)
         ]
         meta = build_meta(2, num_indices, page_size, direction, layout,
                           dev_tok_ids.data_ptr(), host_tok_ids.data_ptr(), geoms)
@@ -168,11 +167,7 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
                     torch.testing.assert_close(got, want, msg=f"D2H mismatch layer={layer}")
         print(f"precision OK (direction={direction}, layout={layout}, page_size={page_size})")
     finally:
-        for host_buf, _, _ in host_holders:
-            try:
-                torch.ops.npu.aclrt_host_unregister(host_buf)
-            except Exception:
-                pass
+        pass  # pinned buffers are freed by GC; no registration to undo
 
 
 def _gather_host(host_buf, layout, num_layers, tok_ids, page_size, head_dim):

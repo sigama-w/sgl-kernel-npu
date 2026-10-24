@@ -331,9 +331,12 @@ int64_t aclrt_host_register(const at::Tensor &buf)
         const int32_t ret = api.aclRegister(buf.data_ptr(), static_cast<uint64_t>(buf.nbytes()),
                                             ACL_HOST_REGISTER_MAPPED, &devPtr);
         if (ret == 0) {
+            fprintf(stderr, "[kv_exchange_aicpu] host register via aclrtHostRegister OK ptr=%p bytes=%zu dva=%p\n",
+                    buf.data_ptr(), static_cast<size_t>(buf.nbytes()), devPtr);
             return static_cast<int64_t>(reinterpret_cast<uintptr_t>(devPtr));
         }
         // ACL path failed (likely driver < 25.0); fall through to HAL.
+        fprintf(stderr, "[kv_exchange_aicpu] aclrtHostRegister FAILED ret=%d, falling back to halHostRegister\n", ret);
     }
 
     // Fallback path: driver HAL + explicit mlock (driver < 25.0).
@@ -351,6 +354,8 @@ int64_t aclrt_host_register(const at::Tensor &buf)
         std::lock_guard<std::mutex> lock(g_hal_reg_mu);
         g_hal_registered.insert(host_ptr);
     }
+    fprintf(stderr, "[kv_exchange_aicpu] host register via halHostRegister OK ptr=%p bytes=%zu dva=%p\n",
+            host_ptr, static_cast<size_t>(buf.nbytes()), devPtr);
     return static_cast<int64_t>(reinterpret_cast<uintptr_t>(devPtr));
 }
 
