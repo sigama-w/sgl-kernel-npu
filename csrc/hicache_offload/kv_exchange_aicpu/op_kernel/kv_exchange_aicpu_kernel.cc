@@ -49,6 +49,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "dlog_pub.h" // device-side slog; output lands in host plog files
+
 namespace {
 
 constexpr int kMetaSlots = 44;
@@ -110,6 +112,9 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
         // meta[kMetaPageSize] is reused as the stage limit (1..4, default 4):
         // stages 1-2 only touch device memory, 3-4 touch host memory, so a
         // limit of 2 gives a fault-free run that proves device access works.
+        // Every stage also dlog-prints BEFORE the access: unlike the status
+        // buffer, the host plog survives an AICPU crash, so the last printed
+        // stage identifies the killer even when the device is poisoned.
         volatile int32_t *status = reinterpret_cast<volatile int32_t *>(meta[kMetaProbeStatusPtr]);
         const int64_t stageLimit = meta[kMetaPageSize] > 0 && meta[kMetaPageSize] < 4 ? meta[kMetaPageSize] : 4;
         const int64_t *devIdx = reinterpret_cast<const int64_t *>(meta[kMetaDeviceIndicesPtr]);
@@ -118,25 +123,42 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
         const uint8_t *devBase = reinterpret_cast<const uint8_t *>(comp[0]);
         const uint8_t *hostBase = reinterpret_cast<const uint8_t *>(comp[1]);
 
+        dlog_error(static_cast<int32_t>(APP),
+                   "[KVX] probe S0 enter param=%p status=%p stageLimit=%d nIdx=%d devIdx=%p hostIdx=%p "
+                   "devBase=%p hostBase=%p meta4=%lx meta5=%lx meta8=%lx meta9=%lx",
+                   static_cast<const void *>(param), static_cast<const void *>(status),
+                   static_cast<int>(stageLimit), static_cast<int>(meta[kMetaNumIndices]),
+                   static_cast<const void *>(devIdx), static_cast<const void *>(hostIdx),
+                   static_cast<const void *>(devBase), static_cast<const void *>(hostBase),
+                   meta[kMetaDeviceIndicesPtr], meta[kMetaHostIndicesPtr], comp[0], comp[1]);
         status[0] = kProbeMagicBase + 0; // kernel running, param/meta readable
         status[8] = static_cast<int32_t>(meta[kMetaNumIndices]);
         if (stageLimit >= 1) {
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S1 enter devIdx=%p", static_cast<const void *>(devIdx));
             status[1] = kProbeMagicBase + 1; // about to read device memory
             status[9] = static_cast<int32_t>(devIdx[0]);
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S1 done devIdx0=%lx", devIdx[0]);
         }
         if (stageLimit >= 2) {
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S2 enter devBase=%p", static_cast<const void *>(devBase));
             status[2] = kProbeMagicBase + 2; // about to read device data
             status[10] = static_cast<int32_t>(devBase[0]);
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S2 done devBase0=%x", status[10]);
         }
         if (stageLimit >= 3) {
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S3 enter hostIdx=%p", static_cast<const void *>(hostIdx));
             status[3] = kProbeMagicBase + 3; // about to read host HVA
             status[11] = static_cast<int32_t>(hostIdx[0]);
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S3 done hostIdx0=%lx", hostIdx[0]);
         }
         if (stageLimit >= 4) {
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S4 enter hostBase=%p", static_cast<const void *>(hostBase));
             status[4] = kProbeMagicBase + 4; // about to read host data
             status[12] = static_cast<int32_t>(hostBase[0]);
+            dlog_error(static_cast<int32_t>(APP), "[KVX] probe S4 done hostBase0=%x", status[12]);
         }
         status[5] = kProbeMagicBase + 5; // requested probes completed
+        dlog_error(static_cast<int32_t>(APP), "[KVX] probe all stages done");
         return kRetOk;
     }
 
