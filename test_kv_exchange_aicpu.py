@@ -183,10 +183,13 @@ PROBE_STAGES = [
 
 
 @pytest.mark.skipif(not (HAS_NPU and HAS_OPS), reason="torch_npu or kv_exchange_aicpu op not available")
-def test_aicpu_probe():
+@pytest.mark.parametrize("max_stage", [2, 4])
+def test_aicpu_probe(max_stage):
     """Diagnostic: which address spaces can the AICPU stars sandbox touch?
 
-    Run alone on a fresh process (it may crash the device on host accesses):
+    max_stage=2 runs device-only stages (S0-S2, must be fault-free); if that
+    passes and max_stage=4 (adds host stages S3-S4) crashes, host access is
+    the killer. Run alone on a fresh process:
         pytest test_kv_exchange_aicpu.py::test_aicpu_probe -v -s
     """
     device = "npu"
@@ -199,7 +202,7 @@ def test_aicpu_probe():
     meta = [0] * 44
     meta[0] = 1  # num_components
     meta[1] = 4  # num_indices (echoed back at status[8])
-    meta[2] = 1  # page_size
+    meta[2] = max_stage  # page_size slot reused as probe stage limit
     meta[3] = 0  # direction 0 = PROBE
     meta[4] = dev_idx.data_ptr()
     meta[5] = host_idx.data_ptr()
@@ -216,8 +219,13 @@ def test_aicpu_probe():
     except Exception as e:  # noqa: BLE001
         err = e
 
-    st = status.cpu().tolist()
-    print(f"\nprobe raw status: {[hex(v) if v else 0 for v in st[:13]]}")
+    try:
+        st = status.cpu().tolist()
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[max_stage={max_stage}] status readout failed (device poisoned by faulting probe): {e}")
+        print("  ==> the crash happened at or before the first host stage if max_stage=2 also shows S0-S2 OK")
+        return
+    print(f"\n[max_stage={max_stage}] probe raw status: {[hex(v) if v else 0 for v in st[:13]]}")
     for slot, comp_slot, name in PROBE_STAGES:
         ok = st[slot] == PROBE_MAGIC + slot and (comp_slot is None or st[comp_slot] != 0)
         print(f"  [{'OK  ' if ok else 'FAIL'}] {name}")

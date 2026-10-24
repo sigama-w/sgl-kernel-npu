@@ -107,7 +107,11 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
         // Probe mode: touch one address per stage. Write the stage magic
         // BEFORE the access and the observed value AFTER it, so a crash
         // leaves the highest magic without its companion value.
+        // meta[kMetaPageSize] is reused as the stage limit (1..4, default 4):
+        // stages 1-2 only touch device memory, 3-4 touch host memory, so a
+        // limit of 2 gives a fault-free run that proves device access works.
         volatile int32_t *status = reinterpret_cast<volatile int32_t *>(meta[kMetaProbeStatusPtr]);
+        const int64_t stageLimit = meta[kMetaPageSize] > 0 && meta[kMetaPageSize] < 4 ? meta[kMetaPageSize] : 4;
         const int64_t *devIdx = reinterpret_cast<const int64_t *>(meta[kMetaDeviceIndicesPtr]);
         const int64_t *hostIdx = reinterpret_cast<const int64_t *>(meta[kMetaHostIndicesPtr]);
         const int64_t *comp = meta + 8;
@@ -116,15 +120,23 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
 
         status[0] = kProbeMagicBase + 0; // kernel running, param/meta readable
         status[8] = static_cast<int32_t>(meta[kMetaNumIndices]);
-        status[1] = kProbeMagicBase + 1; // about to read device memory
-        status[9] = static_cast<int32_t>(devIdx[0]);
-        status[2] = kProbeMagicBase + 2; // about to read device data
-        status[10] = static_cast<int32_t>(devBase[0]);
-        status[3] = kProbeMagicBase + 3; // about to read host HVA
-        status[11] = static_cast<int32_t>(hostIdx[0]);
-        status[4] = kProbeMagicBase + 4; // about to read host data
-        status[12] = static_cast<int32_t>(hostBase[0]);
-        status[5] = kProbeMagicBase + 5; // all probes completed
+        if (stageLimit >= 1) {
+            status[1] = kProbeMagicBase + 1; // about to read device memory
+            status[9] = static_cast<int32_t>(devIdx[0]);
+        }
+        if (stageLimit >= 2) {
+            status[2] = kProbeMagicBase + 2; // about to read device data
+            status[10] = static_cast<int32_t>(devBase[0]);
+        }
+        if (stageLimit >= 3) {
+            status[3] = kProbeMagicBase + 3; // about to read host HVA
+            status[11] = static_cast<int32_t>(hostIdx[0]);
+        }
+        if (stageLimit >= 4) {
+            status[4] = kProbeMagicBase + 4; // about to read host data
+            status[12] = static_cast<int32_t>(hostBase[0]);
+        }
+        status[5] = kProbeMagicBase + 5; // requested probes completed
         return kRetOk;
     }
 
