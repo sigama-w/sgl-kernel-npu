@@ -198,7 +198,7 @@ def register_host_memory(tensor: torch.Tensor) -> HostMemoryMapping:
     """
     host_ptr = tensor.data_ptr()
     nbytes = tensor.numel() * tensor.element_size()
-    if not tensor.is_cpu():
+    if not tensor.is_cpu:
         raise RuntimeError("register_host_memory: tensor must be host (CPU) memory")
     if nbytes <= 0:
         raise RuntimeError("register_host_memory: tensor must be non-empty")
@@ -249,7 +249,7 @@ def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
     host memory resolves to its DVA, everything else keeps its raw address.
     Resolved through the python mapping table (see _G_MAPPINGS).
     """
-    host_ptr = tensor.data_ptr() if tensor.is_cpu() else 0
+    host_ptr = tensor.data_ptr() if tensor.is_cpu else 0
     mapping, reg_ptr = _lookup_mapping(host_ptr)
     if mapping is not None:
         return mapping.device_ptr + (host_ptr - reg_ptr)
@@ -277,7 +277,7 @@ def _resolve_host_dvas(host_tensors, host_mappings) -> List[int]:
     for i, tensor in enumerate(host_tensors):
         m = host_mappings[i] if host_mappings and i < len(host_mappings) else None
         if m is None:
-            ptr = tensor.data_ptr() if tensor.is_cpu() else 0
+            ptr = tensor.data_ptr() if tensor.is_cpu else 0
             mapping, reg_ptr = _lookup_mapping(ptr)
             out.append(
                 0 if mapping is None else mapping.device_ptr + (ptr - reg_ptr)
