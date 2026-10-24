@@ -32,10 +32,21 @@ def _host_pool(shape, dtype=torch.bfloat16):
 
 
 def _page_pairs():
-    """Random distinct token indices; returns (device, host) index tensors."""
-    dev_idx = torch.randperm(NUM_TOKENS, device="npu", dtype=torch.int64)
-    host_idx = torch.randperm(NUM_TOKENS, device="npu", dtype=torch.int64)
-    return dev_idx, host_idx
+    """Page-aligned, collision-free page-pair indices.
+
+    The kernel transfers WHOLE (page, layer) blocks: it derives both page
+    numbers from the first token of each transfer slot (idx[p*PS] // PS). Slot
+    indices must therefore be page-aligned token indices with a distinct page
+    per slot -- exactly the production contract (hicache token indices are
+    page*page_size + offset, grouped page by page). Random token permutations
+    would alias pages across slots and corrupt the comparison.
+    """
+    offset = torch.arange(PS, dtype=torch.int64).repeat(PAGES)
+    dev_pages = torch.randperm(PAGES, dtype=torch.int64)
+    host_pages = torch.randperm(PAGES, dtype=torch.int64)
+    dev_idx = (dev_pages * PS).repeat_interleave(PS) + offset
+    host_idx = (host_pages * PS).repeat_interleave(PS) + offset
+    return dev_idx.to("npu"), host_idx.to("npu")
 
 
 class TestKvExchangeAclrt(unittest.TestCase):
