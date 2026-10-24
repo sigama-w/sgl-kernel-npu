@@ -17,6 +17,14 @@ _PAGE_SIZE = 4096
 # transfer ops resolve host pool DVAs without the caller carrying mappings.
 _G_MAPPINGS: List[tuple] = []
 
+# Host-address provider mode, mirrored to the C++ side via
+# aclrt_set_host_dva_mode (the seam for a future memfabric resolver):
+#   "aclrt" (default) host pool pointers resolve through _G_MAPPINGS to their
+#                     registered DVA
+#   "passthrough"     host pointers are already device-accessible; they are
+#                     handed to the kernels unchanged
+_g_passthrough = False
+
 
 def _lookup_mapping(host_ptr: int):
     """Return ``(mapping, reg_ptr)`` for the registered range holding
@@ -250,6 +258,8 @@ def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
     Resolved through the python mapping table (see _G_MAPPINGS).
     """
     host_ptr = tensor.data_ptr() if tensor.is_cpu else 0
+    if _g_passthrough:
+        return tensor.data_ptr()
     mapping, reg_ptr = _lookup_mapping(host_ptr)
     if mapping is not None:
         return mapping.device_ptr + (host_ptr - reg_ptr)
@@ -263,8 +273,18 @@ def set_host_dva_mode(mode: str) -> None:
     by register_host_memory; "passthrough" hands host pointers to the kernel
     unchanged (they must already be device-accessible). This is the swap point
     for a future memfabric DVA provider — transfer ops and the AIV kernel are
-    provider-agnostic.
+    provider-agnostic. The mode is tracked python-side (get_device_accessible_ptr
+    and the transfer wrappers consult it) and mirrored to the C++ fallback.
     """
+    global _g_passthrough
+    if mode == "aclrt":
+        _g_passthrough = False
+    elif mode == "passthrough":
+        _g_passthrough = True
+    else:
+        raise RuntimeError(
+            f"aclrt_set_host_dva_mode: unknown mode '{mode}' (expected 'aclrt' or 'passthrough')"
+        )
     torch.ops.npu.aclrt_set_host_dva_mode(mode)
 
 
@@ -276,7 +296,11 @@ def _resolve_host_dvas(host_tensors, host_mappings) -> List[int]:
     out = []
     for i, tensor in enumerate(host_tensors):
         m = host_mappings[i] if host_mappings and i < len(host_mappings) else None
-        if m is None:
+        if _g_passthrough:
+            # Host pointers are already device-accessible; hand them over raw
+            # (mirrors the C++ ResolveHostDva passthrough fallback).
+            out.append(tensor.data_ptr() if tensor.is_cpu else 0)
+        elif m is None:
             ptr = tensor.data_ptr() if tensor.is_cpu else 0
             mapping, reg_ptr = _lookup_mapping(ptr)
             out.append(
