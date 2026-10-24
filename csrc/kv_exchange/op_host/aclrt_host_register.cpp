@@ -40,9 +40,9 @@ using aclrtHostRegisterFunc = int32_t (*)(void *, uint64_t, int32_t, void **);
 // int32_t aclrtHostUnregister(void *ptr)
 using aclrtHostUnregisterFunc = int32_t (*)(void *);
 
-#ifndef ACL_HOST_REGISTER_MAPPED
-#define ACL_HOST_REGISTER_MAPPED 1
-#endif
+// ACL_HOST_REGISTER_MAPPED comes from <acl/acl_rt.h> (via acl/acl.h). It is an
+// enum constant (=0 on CANN 9.1+), NOT a macro -- never #define it here, that
+// would shadow the header value with a wrong flag and fail with ret=207000.
 
 struct HostRange {
     uintptr_t hva = 0;
@@ -140,7 +140,8 @@ HOST_API int64_t aclrt_host_register(const at::Tensor &buf)
     void *dev_ptr = nullptr;
     const int32_t ret = GetAclHostRegister()(host_ptr, bytes, ACL_HOST_REGISTER_MAPPED, &dev_ptr);
     TORCH_CHECK(ret == 0 && dev_ptr != nullptr, "aclrtHostRegister failed, ret=", ret, " ptr=", host_ptr,
-                " bytes=", bytes, " (driver >= 25.0 is required for ACL_HOST_REGISTER_MAPPED)");
+                " bytes=", bytes, " (type=ACL_HOST_REGISTER_MAPPED=", static_cast<int32_t>(ACL_HOST_REGISTER_MAPPED),
+                ")");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(dev_ptr) != reinterpret_cast<uintptr_t>(host_ptr),
                 "aclrtHostRegister returned the host address unchanged; the mapping is not usable by AIV kernels");
 
