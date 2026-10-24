@@ -146,8 +146,8 @@ class TestKvExchangeAclrt(unittest.TestCase):
                     dev_page = int(dev_idx[p * PS]) // PS
                     host_page = int(host_idx[p * PS]) // PS
                     torch.testing.assert_close(
-                        host_scale[host_page, idx_layer, :, 0, 0].cpu(),
-                        dev_scale[idx_layer, dev_page, :, 0, 0].cpu(),
+                        host_scale[host_page, idx_layer, :, 0].cpu(),
+                        dev_scale[idx_layer, dev_page, :, 0].cpu(),
                         msg=f"scale mismatch idx_layer={idx_layer} page={p}",
                     )
         finally:
