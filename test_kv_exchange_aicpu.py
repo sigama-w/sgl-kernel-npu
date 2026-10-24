@@ -244,7 +244,7 @@ def test_aicpu_probe(max_stage):
     for slot, comp_slot, name in PROBE_STAGES:
         # Stage OK = its magic was written. The companion value slot (comp_slot)
         # is printed for reference only: a 0 there can be a legitimately read 0.
-        observed = hex(st[comp_slot]) if (comp_slot is not None and st[comp_slot]) else st[comp_slot]
+        observed = (hex(st[comp_slot]) if st[comp_slot] else str(st[comp_slot])) if comp_slot is not None else "-"
         ok = st[slot] == PROBE_MAGIC + slot
         print(f"  [{'OK  ' if ok else 'FAIL'}] {name} (observed={observed})")
     if err is not None:
