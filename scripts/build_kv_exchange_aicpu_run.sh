@@ -10,11 +10,14 @@
 #   libcann_kv_exchange_kernel.json    kernel registration json
 #   cann-kv-exchange-aicpu.tar.gz      packaged tar (aicpu_kernels_device/ root)
 #
-# Install layout expected by the aclrtBinaryLoadFromFile loader:
+# Install layout (mirrors memfabric script/kernel/install.sh exactly):
 #   $ASCEND_HOME_PATH/opp/vendors/cust/op_impl/aicpu/config/libcann_kv_exchange_kernel.json
-#   $ASCEND_HOME_PATH/opp/vendors/cust/op_impl/aicpu/kernel/libcann_kv_exchange_kernel.so
-# The .so is additionally copied into kernel/aicpu_kernels_device/ to cover either
-# kernelSo resolution convention.
+#   $ASCEND_HOME_PATH/opp/vendors/cust/op_impl/aicpu/kernel/cann-kv-exchange-aicpu.tar.gz
+#   $ASCEND_HOME_PATH/conf/ascend_package_load.ini  <- REQUIRED: registers the
+#       tar.gz with the CANN package loader so the device side actually mounts
+#       aicpu_kernels_device/libcann_kv_exchange_kernel.so. Without this entry
+#       the host-side BinaryLoad succeeds but the kernel dies at execution
+#       (aicpu exception 507018) because the .so never reaches the device.
 #
 # Alternative deployment without touching CANN dirs: put the .so and .json in any
 # readable directory and export SGL_KV_EXCHANGE_AICPU_JSON=/path/to/libcann_kv_exchange_kernel.json
@@ -67,13 +70,39 @@ if [[ "${1:-}" == "install" ]]; then
     CUST_DIR="${ASCEND_HOME_PATH}/opp/vendors/cust/op_impl/aicpu"
     echo "=== install into ${CUST_DIR} ==="
     mkdir -p "${CUST_DIR}/config" "${CUST_DIR}/kernel/aicpu_kernels_device"
-    cp "${BUILD_DIR}/libcann_kv_exchange_kernel.json" "${CUST_DIR}/config/"
-    cp "${BUILD_DIR}/libcann_kv_exchange_kernel.so" "${CUST_DIR}/kernel/"
-    cp "${BUILD_DIR}/libcann_kv_exchange_kernel.so" "${CUST_DIR}/kernel/aicpu_kernels_device/"
+    cp -f "${BUILD_DIR}/libcann_kv_exchange_kernel.json" "${CUST_DIR}/config/"
+    # tar.gz is what the CANN package loader mounts on the device side
+    cp -f "${BUILD_DIR}/cann-kv-exchange-aicpu.tar.gz" "${CUST_DIR}/kernel/"
+    # bare .so copies: debugging convenience only, not used by the loader
+    cp -f "${BUILD_DIR}/libcann_kv_exchange_kernel.so" "${CUST_DIR}/kernel/"
+    cp -f "${BUILD_DIR}/libcann_kv_exchange_kernel.so" "${CUST_DIR}/kernel/aicpu_kernels_device/"
+
+    # Register the package with the CANN loader (mirrors mf install.sh):
+    # without this ini entry the device never mounts our kernel .so and every
+    # launch dies with "aicpu exception" (507018) before executing a byte.
+    INI_FILE="${ASCEND_HOME_PATH}/conf/ascend_package_load.ini"
+    mkdir -p "$(dirname "${INI_FILE}")"
+    if [ -f "${INI_FILE}" ]; then
+        while grep -q '^name:cann-kv-exchange-aicpu.tar.gz$' "${INI_FILE}" 2>/dev/null; do
+            sed -i '/^name:cann-kv-exchange-aicpu.tar.gz$/,+4d' "${INI_FILE}"
+        done
+        printf '\n' >> "${INI_FILE}"
+    fi
+    cat >> "${INI_FILE}" <<INIEOF
+name:cann-kv-exchange-aicpu.tar.gz
+install_path:2
+optional:true
+package_path:opp/vendors/cust/op_impl/aicpu/kernel
+load_as_per_soc:false
+INIEOF
+
     echo "installed:"
     ls -l "${CUST_DIR}/config/libcann_kv_exchange_kernel.json" \
+        "${CUST_DIR}/kernel/cann-kv-exchange-aicpu.tar.gz" \
         "${CUST_DIR}/kernel/libcann_kv_exchange_kernel.so" \
         "${CUST_DIR}/kernel/aicpu_kernels_device/libcann_kv_exchange_kernel.so"
+    echo "Updated: ${INI_FILE}"
+    grep -A 4 '^name:cann-kv-exchange-aicpu.tar.gz$' "${INI_FILE}"
     echo "NOTE: if the loader still cannot resolve kernelSo, fall back to:"
     echo "  export SGL_KV_EXCHANGE_AICPU_JSON=${BUILD_DIR}/libcann_kv_exchange_kernel.json"
 fi
