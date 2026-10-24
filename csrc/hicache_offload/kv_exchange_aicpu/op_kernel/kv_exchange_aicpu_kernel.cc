@@ -109,14 +109,14 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
         // Probe mode: touch one address per stage. Write the stage magic
         // BEFORE the access and the observed value AFTER it, so a crash
         // leaves the highest magic without its companion value.
-        // meta[kMetaPageSize] is reused as the stage limit (1..4, default 4):
-        // stages 1-2 only touch device memory, 3-4 touch host memory, so a
-        // limit of 2 gives a fault-free run that proves device access works.
+        // meta[kMetaPageSize] is reused as the stage limit (0..4, default 4):
+        // 0 = touch nothing (pure return, proves the kernel executes at all),
+        // 1-2 only touch device memory, 3-4 touch host memory.
         // Every stage also dlog-prints BEFORE the access: unlike the status
         // buffer, the host plog survives an AICPU crash, so the last printed
         // stage identifies the killer even when the device is poisoned.
         volatile int32_t *status = reinterpret_cast<volatile int32_t *>(meta[kMetaProbeStatusPtr]);
-        const int64_t stageLimit = meta[kMetaPageSize] > 0 && meta[kMetaPageSize] < 4 ? meta[kMetaPageSize] : 4;
+        const int64_t stageLimit = meta[kMetaPageSize] >= 0 && meta[kMetaPageSize] <= 4 ? meta[kMetaPageSize] : 4;
         const int64_t *devIdx = reinterpret_cast<const int64_t *>(meta[kMetaDeviceIndicesPtr]);
         const int64_t *hostIdx = reinterpret_cast<const int64_t *>(meta[kMetaHostIndicesPtr]);
         const int64_t *comp = meta + 8;

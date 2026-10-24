@@ -183,14 +183,15 @@ PROBE_STAGES = [
 
 
 @pytest.mark.skipif(not (HAS_NPU and HAS_OPS), reason="torch_npu or kv_exchange_aicpu op not available")
-@pytest.mark.parametrize("max_stage", [2, 4])
+@pytest.mark.parametrize("max_stage", [0, 2, 4])
 def test_aicpu_probe(max_stage):
     """Diagnostic: which address spaces can the AICPU stars sandbox touch?
 
-    max_stage=2 runs device-only stages (S0-S2, must be fault-free); if that
+    max_stage=0 touches nothing (pure return; must pass or the kernel never
+    executes at all). max_stage=2 runs device-only stages (S0-S2); if that
     passes and max_stage=4 (adds host stages S3-S4) crashes, host access is
-    the killer. Run alone on a fresh process:
-        pytest test_kv_exchange_aicpu.py::test_aicpu_probe -v -s
+    the killer. Run alone on a fresh process, lowest stage first:
+        pytest "test_kv_exchange_aicpu.py::test_aicpu_probe[0]" -v -s
     """
     device = "npu"
     status = torch.zeros(16, dtype=torch.int32, device=device)
