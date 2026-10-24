@@ -152,3 +152,76 @@ def transfer_mamba_state(
         host_indices,
         direction.value,
     )
+
+
+def aclrt_host_register(tensor: torch.Tensor) -> int:
+    """
+    Register host (CPU) memory with aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
+    and return the device-visible address (DVA) an AIV kernel must use to
+    dereference it. ``tensor`` must be kept alive until aclrt_host_unregister
+    is called on it.
+    """
+    return torch.ops.npu.aclrt_host_register(tensor)
+
+
+def aclrt_host_unregister(tensor: torch.Tensor) -> None:
+    """Undo aclrt_host_register for memory registered via aclrt_host_register."""
+    torch.ops.npu.aclrt_host_unregister(tensor)
+
+
+def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
+    """Return the address a kernel on ``device_index`` must use for ``tensor``.
+
+    Mirrors sgl_kernel.kvcacheio.get_device_accessible_ptr (CUDA): registered
+    host memory resolves to its DVA, everything else keeps its raw address.
+    """
+    return torch.ops.npu.aclrt_get_device_accessible_ptr(tensor, device_index)
+
+
+def set_host_dva_mode(mode: str) -> None:
+    """Select how the kv_exchange transfer ops resolve host pool pointers.
+
+    "aclrt" (default) resolves through the aclrtHostRegister table populated
+    by aclrt_host_register; "passthrough" hands host pointers to the kernel
+    unchanged (they must already be device-accessible). This is the swap point
+    for a future memfabric DVA provider — transfer ops and the AIV kernel are
+    provider-agnostic.
+    """
+    torch.ops.npu.aclrt_set_host_dva_mode(mode)
+
+
+def transfer_kv_per_layer_direct_pf_lf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    page_size: int,
+):
+    """
+    H2D, one layer: registered host pool (page-first, 5-D) -> device pool
+    (layer-first, 5-D). src_ptrs/dst_ptrs are matching component lists
+    (k/v/index_k/index_k_scale); host-side tensors must be registered via
+    aclrt_host_register. Signature mirrors sgl_kernel (CUDA).
+    """
+    torch.ops.npu.transfer_kv_per_layer_direct_pf_lf(
+        list(src_ptrs), list(dst_ptrs), src_indices, dst_indices, layer_id, page_size
+    )
+
+
+def transfer_kv_all_layer_direct_lf_pf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int,
+):
+    """
+    D2H, all layers: device pool (layer-first, 5-D) -> registered host pool
+    (page-first, 5-D). Per-component layer ranges follow the device buffer's
+    layer count, so components covering fewer layers (indexer k / scales) need
+    no extra mapping on the caller side. Signature mirrors sgl_kernel (CUDA).
+    """
+    torch.ops.npu.transfer_kv_all_layer_direct_lf_pf(
+        list(src_ptrs), list(dst_ptrs), src_indices, dst_indices, page_size
+    )

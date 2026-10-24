@@ -64,6 +64,24 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "transfer_state_all_layer_direct_lf_pf(Tensor[] device_states, Tensor[] host_states, "
         "Tensor device_indices, Tensor host_indices, int flags) -> ()");
 
+    m.def("kv_exchange(Tensor meta, int block_dim=64) -> ()");
+
+    m.def(
+        "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, "
+        "Tensor src_indices, Tensor dst_indices, int layer_id, int page_size) -> ()");
+
+    m.def(
+        "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, "
+        "Tensor src_indices, Tensor dst_indices, int page_size) -> ()");
+
+    m.def("aclrt_host_register(Tensor buf) -> int");
+
+    m.def("aclrt_host_unregister(Tensor buf) -> ()");
+
+    m.def("aclrt_get_device_accessible_ptr(Tensor buf, int device_index) -> int");
+
+    m.def("aclrt_set_host_dva_mode(str mode) -> ()");
+
     m.def(
         "bgmv_expand(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y,"
         "            int slice_offset, int slice_size) -> Tensor");
@@ -274,6 +292,16 @@ TORCH_LIBRARY_IMPL(npu, CatchAll, m)
 }
 #endif
 
+TORCH_LIBRARY_IMPL(npu, CatchAll, m)
+{
+    // Host registration control-plane ops take CPU tensors, so PrivateUse1
+    // dispatch cannot infer the backend from their inputs.
+    m.impl("aclrt_host_register", TORCH_FN(sglang::npu_kernel::aclrt_host_register));
+    m.impl("aclrt_host_unregister", TORCH_FN(sglang::npu_kernel::aclrt_host_unregister));
+    m.impl("aclrt_get_device_accessible_ptr", TORCH_FN(sglang::npu_kernel::aclrt_get_device_accessible_ptr));
+    m.impl("aclrt_set_host_dva_mode", TORCH_FN(sglang::npu_kernel::aclrt_set_host_dva_mode));
+}
+
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 {
     m.impl("helloworld", TORCH_FN(sglang::npu_kernel::helloworld));
@@ -296,6 +324,10 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 
     m.impl("transfer_state_all_layer_direct_lf_pf",
            TORCH_FN(sglang::npu_kernel::transfer_state_all_layer_direct_lf_pf));
+
+    m.impl("kv_exchange", TORCH_FN(sglang::npu_kernel::kv_exchange));
+    m.impl("transfer_kv_per_layer_direct_pf_lf", TORCH_FN(sglang::npu_kernel::transfer_kv_per_layer_direct_pf_lf));
+    m.impl("transfer_kv_all_layer_direct_lf_pf", TORCH_FN(sglang::npu_kernel::transfer_kv_all_layer_direct_lf_pf));
 
     m.impl("bgmv_expand", TORCH_FN(sglang::npu_kernel::bgmv_expand));
 

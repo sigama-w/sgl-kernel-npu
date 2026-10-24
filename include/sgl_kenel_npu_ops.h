@@ -67,6 +67,30 @@ void transfer_state_all_layer_direct_lf_pf(at::TensorList device_states,
                                            const at::Tensor &host_indices,
                                            int64_t flags);
 
+// AIV kv_exchange: register host memory / exchange KV pages between a
+// registered host pool and the device (see csrc/kv_exchange/op_host/).
+int64_t aclrt_host_register(const at::Tensor &buf);
+
+void aclrt_host_unregister(const at::Tensor &buf);
+
+int64_t aclrt_get_device_accessible_ptr(const at::Tensor &buf, int64_t device_index);
+
+// Select the host-address provider for the kv_exchange transfer ops:
+// "aclrt" (default) or "passthrough" (host pointers already device-accessible;
+// the swap point for a future memfabric resolver).
+void aclrt_set_host_dva_mode(const std::string &mode);
+
+void kv_exchange(const at::Tensor &meta, int64_t block_dim);
+
+void transfer_kv_per_layer_direct_pf_lf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
+                                        const at::Tensor &src_indices,
+                                        const at::Tensor &dst_indices, int64_t layer_id,
+                                        int64_t page_size);
+
+void transfer_kv_all_layer_direct_lf_pf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
+                                        const at::Tensor &src_indices,
+                                        const at::Tensor &dst_indices, int64_t page_size);
+
 at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
                        at::Tensor &y, int64_t slice_offset, int64_t slice_size);
 
