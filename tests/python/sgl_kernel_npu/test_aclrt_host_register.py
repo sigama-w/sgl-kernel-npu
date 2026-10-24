@@ -3,10 +3,11 @@ import unittest
 import torch
 
 from sgl_kernel_npu.kvcacheio import (
-    aclrt_host_register,
-    aclrt_host_unregister,
+    HostMemoryMapping,
     get_device_accessible_ptr,
+    register_host_memory,
     set_host_dva_mode,
+    unregister_host_memory,
 )
 
 REG_BYTES = 4 * 1024 * 1024
@@ -20,21 +21,29 @@ def _aligned_pinned(numel: int, dtype=torch.bfloat16) -> torch.Tensor:
 
 class TestAclrtHostRegister(unittest.TestCase):
 
-    def test_register_returns_dva_and_resolves(self):
+    def test_register_returns_mapping_and_resolves(self):
         torch.npu.set_device(0)
         buf = _aligned_pinned(REG_BYTES // 2)
         hva = buf.data_ptr()
-        dva = aclrt_host_register(buf)
-        self.assertIsInstance(dva, int)
-        self.assertNotEqual(dva, 0)
-        self.assertNotEqual(dva, hva)
-        # Full-tensor lookup resolves to the DVA.
-        self.assertEqual(get_device_accessible_ptr(buf, 0), dva)
+        mapping = register_host_memory(buf)
+        self.assertIsInstance(mapping, HostMemoryMapping)
+        self.assertTrue(mapping.owned)
+        self.assertIsInstance(mapping.device_ptr, int)
+        self.assertNotEqual(mapping.device_ptr, 0)
+        self.assertNotEqual(mapping.device_ptr, hva)
+        # The registered base is page-aligned and at or below the tensor.
+        self.assertLessEqual(mapping.registered_host_ptr, hva)
+        self.assertLessEqual(hva - mapping.registered_host_ptr, 4096)
+        # Full-tensor lookup resolves to the mapping's device_ptr.
+        self.assertEqual(get_device_accessible_ptr(buf, 0), mapping.device_ptr)
         # A view inside the registered range resolves into the same range.
         off = 4096 // 2  # elements (bf16), keep 4K alignment
         view = buf[off:off + 16]
-        self.assertEqual(get_device_accessible_ptr(view, 0), dva + off * view.element_size())
-        aclrt_host_unregister(buf)
+        self.assertEqual(
+            get_device_accessible_ptr(view, 0),
+            mapping.device_ptr + off * view.element_size(),
+        )
+        unregister_host_memory(mapping)
         # After unregistration the raw address is returned again.
         self.assertEqual(get_device_accessible_ptr(buf, 0), buf.data_ptr())
 
@@ -52,35 +61,54 @@ class TestAclrtHostRegister(unittest.TestCase):
         torch.npu.set_device(0)
         a = _aligned_pinned(REG_BYTES // 2)
         b = _aligned_pinned(REG_BYTES // 2)
-        dva_a = aclrt_host_register(a)
-        dva_b = aclrt_host_register(b)
-        self.assertNotEqual(dva_a, dva_b)
-        self.assertEqual(get_device_accessible_ptr(a, 0), dva_a)
-        self.assertEqual(get_device_accessible_ptr(b, 0), dva_b)
-        aclrt_host_unregister(a)
+        mapping_a = register_host_memory(a)
+        mapping_b = register_host_memory(b)
+        self.assertNotEqual(mapping_a.device_ptr, mapping_b.device_ptr)
+        self.assertEqual(get_device_accessible_ptr(a, 0), mapping_a.device_ptr)
+        self.assertEqual(get_device_accessible_ptr(b, 0), mapping_b.device_ptr)
+        unregister_host_memory(mapping_a)
         self.assertEqual(get_device_accessible_ptr(a, 0), a.data_ptr())
-        self.assertEqual(get_device_accessible_ptr(b, 0), dva_b)
-        aclrt_host_unregister(b)
+        self.assertEqual(get_device_accessible_ptr(b, 0), mapping_b.device_ptr)
+        unregister_host_memory(mapping_b)
 
-    def test_double_register_and_unregistered_free_raise(self):
+    def test_duplicate_register_borrows_and_owned_release(self):
+        # PR #39548 semantics: re-registering an already-mapped range borrows
+        # the existing mapping (owned=False) instead of failing, and only the
+        # owner releases the runtime registration.
         torch.npu.set_device(0)
         buf = _aligned_pinned(1024 * 1024)
-        aclrt_host_register(buf)
+        owner = register_host_memory(buf)
+        self.assertTrue(owner.owned)
+        borrower = register_host_memory(buf)
+        self.assertFalse(borrower.owned)
+        self.assertEqual(borrower.device_ptr, owner.device_ptr)
+        self.assertEqual(borrower.registered_host_ptr, owner.registered_host_ptr)
+        # Borrower release is a no-op: the mapping stays live.
+        unregister_host_memory(borrower)
+        self.assertEqual(get_device_accessible_ptr(buf, 0), owner.device_ptr)
+        # Owner release frees it; a stale borrower release afterwards is a
+        # silent no-op too (owned=False).
+        unregister_host_memory(owner)
+        self.assertEqual(get_device_accessible_ptr(buf, 0), buf.data_ptr())
+        unregister_host_memory(borrower)
+        # The range is gone: re-registering must succeed with a fresh mapping.
+        again = register_host_memory(buf)
+        self.assertTrue(again.owned)
+        self.assertNotEqual(again.device_ptr, 0)
+        unregister_host_memory(again)
+
+    def test_unregistered_owned_free_raises(self):
+        torch.npu.set_device(0)
+        buf = _aligned_pinned(1024)
+        stale = HostMemoryMapping(buf.data_ptr(), buf.data_ptr(), True)
         with self.assertRaises(RuntimeError):
-            aclrt_host_register(buf)
-        aclrt_host_unregister(buf)
-        with self.assertRaises(RuntimeError):
-            aclrt_host_unregister(buf)
-        # The range is gone: re-registering must succeed.
-        dva = aclrt_host_register(buf)
-        self.assertNotEqual(dva, 0)
-        aclrt_host_unregister(buf)
+            unregister_host_memory(stale)
 
     def test_non_cpu_rejected(self):
         torch.npu.set_device(0)
         dev = torch.zeros(16, dtype=torch.float32, device="npu")
         with self.assertRaises(RuntimeError):
-            aclrt_host_register(dev)
+            register_host_memory(dev)
 
     def test_host_dva_mode_switch(self):
         # The provider mode is the seam for swapping in a future memfabric
@@ -88,8 +116,8 @@ class TestAclrtHostRegister(unittest.TestCase):
         # bypasses it for already-device-accessible host pointers.
         torch.npu.set_device(0)
         buf = _aligned_pinned(REG_BYTES // 2)
-        dva = aclrt_host_register(buf)
-        self.assertEqual(get_device_accessible_ptr(buf, 0), dva)
+        mapping = register_host_memory(buf)
+        self.assertEqual(get_device_accessible_ptr(buf, 0), mapping.device_ptr)
         with self.assertRaises(RuntimeError):
             set_host_dva_mode("invalid-mode")
         set_host_dva_mode("passthrough")
@@ -99,8 +127,8 @@ class TestAclrtHostRegister(unittest.TestCase):
             self.assertEqual(get_device_accessible_ptr(buf, 0), buf.data_ptr())
         finally:
             set_host_dva_mode("aclrt")
-        self.assertEqual(get_device_accessible_ptr(buf, 0), dva)
-        aclrt_host_unregister(buf)
+        self.assertEqual(get_device_accessible_ptr(buf, 0), mapping.device_ptr)
+        unregister_host_memory(mapping)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,10 @@ import unittest
 import torch
 
 from sgl_kernel_npu.kvcacheio import (
-    aclrt_host_register,
-    aclrt_host_unregister,
+    register_host_memory,
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_per_layer_direct_pf_lf,
+    unregister_host_memory,
 )
 
 # Geometry mirrors sglang pool_host/mla.py page_first_kv_split (MLA host pool):
@@ -25,10 +25,10 @@ NUM_TOKENS = PAGES * PS
 
 
 def _host_pool(shape, dtype=torch.bfloat16):
-    """Pinned + registered host pool; returns (tensor, holder)."""
+    """Pinned + registered host pool; returns (tensor, HostMemoryMapping)."""
     buf = torch.randn(shape).to(dtype).pin_memory().contiguous()
-    aclrt_host_register(buf)
-    return buf
+    mapping = register_host_memory(buf)
+    return buf, mapping
 
 
 def _page_pairs():
@@ -64,39 +64,43 @@ class TestKvExchangeAclrt(unittest.TestCase):
 
     def test_h2d_per_layer_kv(self):
         torch.npu.set_device(0)
-        host_k = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
-        host_v = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
         dev_k = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
         dev_v = torch.zeros((LAYERS, PAGES, PS, 1, V_WIDTH), dtype=torch.bfloat16, device="npu")
         dev_idx, host_idx = _page_pairs()
         try:
             for layer in range(LAYERS):
                 transfer_kv_per_layer_direct_pf_lf(
-                    [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PS
+                    [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PS,
+                    host_mappings=[mk, mv],
                 )
             torch.npu.synchronize()
             for layer in range(LAYERS):
                 self._check_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
                 self._check_pages(host_v, dev_v, dev_idx, host_idx, layer, layer)
         finally:
-            aclrt_host_unregister(host_k)
-            aclrt_host_unregister(host_v)
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
 
     def test_h2d_indexer_layer_mapping(self):
         """Indexer components transfer under their own (mapped) layer id."""
         torch.npu.set_device(0)
-        host_k = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
         dev_k = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
-        host_idx_k = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
+        host_idx_k, mik = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
         dev_idx_k = torch.zeros((IDX_LAYERS, PAGES, PS, 1, IDX_WIDTH), dtype=torch.bfloat16, device="npu")
         dev_idx, host_idx = _page_pairs()
         try:
             for layer in range(LAYERS):
-                transfer_kv_per_layer_direct_pf_lf([host_k], [dev_k], host_idx, dev_idx, layer, PS)
+                transfer_kv_per_layer_direct_pf_lf(
+                    [host_k], [dev_k], host_idx, dev_idx, layer, PS, host_mappings=[mk]
+                )
             # _indexer_slot_range_for_layer-style mapping: pool layer -> indexer layer.
             for idx_layer in range(IDX_LAYERS):
                 transfer_kv_per_layer_direct_pf_lf(
-                    [host_idx_k], [dev_idx_k], host_idx, dev_idx, idx_layer, PS
+                    [host_idx_k], [dev_idx_k], host_idx, dev_idx, idx_layer, PS,
+                    host_mappings=[mik],
                 )
             torch.npu.synchronize()
             for layer in range(LAYERS):
@@ -104,8 +108,8 @@ class TestKvExchangeAclrt(unittest.TestCase):
             for idx_layer in range(IDX_LAYERS):
                 self._check_pages(host_idx_k, dev_idx_k, dev_idx, host_idx, idx_layer, idx_layer)
         finally:
-            aclrt_host_unregister(host_k)
-            aclrt_host_unregister(host_idx_k)
+            unregister_host_memory(mk)
+            unregister_host_memory(mik)
 
     def test_d2h_all_layer_kv_index_scales(self):
         """All-layer D2H with mixed-width and fp32-scale components.
@@ -114,10 +118,10 @@ class TestKvExchangeAclrt(unittest.TestCase):
         get a trailing singleton padded on the call (5-D op requirement).
         """
         torch.npu.set_device(0)
-        host_k = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
-        host_v = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
-        host_idx_k = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
-        host_scale = _host_pool((PAGES, IDX_LAYERS, PS, 1), dtype=torch.float32)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        host_idx_k, mik = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
+        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1), dtype=torch.float32)
         host_k.zero_()
         host_v.zero_()
         host_idx_k.zero_()
@@ -135,6 +139,7 @@ class TestKvExchangeAclrt(unittest.TestCase):
                 dev_idx,
                 host_idx,
                 PS,
+                host_mappings=[mk, mv, mik, msc],
             )
             torch.npu.synchronize()
             for layer in range(LAYERS):
@@ -151,20 +156,22 @@ class TestKvExchangeAclrt(unittest.TestCase):
                         msg=f"scale mismatch idx_layer={idx_layer} page={p}",
                     )
         finally:
-            aclrt_host_unregister(host_k)
-            aclrt_host_unregister(host_v)
-            aclrt_host_unregister(host_idx_k)
-            aclrt_host_unregister(host_scale)
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
+            unregister_host_memory(mik)
+            unregister_host_memory(msc)
 
     def test_wide_row_split(self):
         """Row width above the 88KB UB budget must still transfer correctly."""
         torch.npu.set_device(0)
         wide = 65536  # bf16 -> 128KB rows
-        host = _host_pool((PAGES, 1, PS, 1, wide))
+        host, m = _host_pool((PAGES, 1, PS, 1, wide))
         host.zero_()
         dev = torch.randn((1, PAGES, PS, 1, wide), device="npu").to(torch.bfloat16)
         dev_idx, host_idx = _page_pairs()
         try:
+            # Registry-based resolution (no host_mappings): the registered
+            # mapping is found through the process table instead.
             transfer_kv_per_layer_direct_pf_lf([host], [dev], host_idx, dev_idx, 0, PS)
             torch.npu.synchronize()
             for p in range(PAGES):
@@ -176,7 +183,7 @@ class TestKvExchangeAclrt(unittest.TestCase):
                     msg=f"wide-row mismatch page={p}",
                 )
         finally:
-            aclrt_host_unregister(host)
+            unregister_host_memory(m)
 
     def test_unregistered_host_raises(self):
         torch.npu.set_device(0)
@@ -188,7 +195,7 @@ class TestKvExchangeAclrt(unittest.TestCase):
 
     def test_too_many_components_raises(self):
         torch.npu.set_device(0)
-        host = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host, m = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
         dev = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
         dev_idx, host_idx = _page_pairs()
         try:
@@ -197,7 +204,7 @@ class TestKvExchangeAclrt(unittest.TestCase):
                     [host] * 5, [dev] * 5, host_idx, dev_idx, 0, PS
                 )
         finally:
-            aclrt_host_unregister(host)
+            unregister_host_memory(m)
 
 
 if __name__ == "__main__":

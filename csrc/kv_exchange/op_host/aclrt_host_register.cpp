@@ -16,10 +16,6 @@
 #include "defines.h"
 #include "torch_helper.h"
 
-#include <acl/acl.h>
-
-#include <dlfcn.h>
-
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -35,48 +31,14 @@ namespace {
 // false = "aclrt" (default, registry lookup); true = "passthrough".
 std::atomic<bool> g_passthrough{false};
 
-// int32_t aclrtHostRegister(void *ptr, uint64_t size, int32_t type, void **devPtr)
-using aclrtHostRegisterFunc = int32_t (*)(void *, uint64_t, int32_t, void **);
-// int32_t aclrtHostUnregister(void *ptr)
-using aclrtHostUnregisterFunc = int32_t (*)(void *);
-
-// ACL_HOST_REGISTER_MAPPED comes from <acl/acl_rt.h> (via acl/acl.h). It is an
-// enum constant (=0 on CANN 9.1+), NOT a macro -- never #define it here, that
-// would shadow the header value with a wrong flag and fail with ret=207000.
-
 struct HostRange {
-    uintptr_t hva = 0;
-    uint64_t size = 0;
-    uintptr_t dva = 0;
+    uintptr_t hva = 0;  // page-aligned host base passed to aclrtHostRegister
+    uint64_t size = 0;  // page-aligned span actually registered
+    uintptr_t dva = 0;  // device-visible address of the registered base
 };
 
 std::mutex g_ranges_mu;
 std::vector<HostRange> g_ranges;  // sorted by hva, non-overlapping
-
-aclrtHostRegisterFunc GetAclHostRegister()
-{
-    static aclrtHostRegisterFunc fn = reinterpret_cast<aclrtHostRegisterFunc>(dlsym(RTLD_DEFAULT, "aclrtHostRegister"));
-    TORCH_CHECK(fn != nullptr, "aclrtHostRegister is not available in this CANN runtime; "
-                               "host registration for the AIV kv_exchange backend cannot proceed");
-    return fn;
-}
-
-aclrtHostUnregisterFunc GetAclHostUnregister()
-{
-    static aclrtHostUnregisterFunc fn =
-        reinterpret_cast<aclrtHostUnregisterFunc>(dlsym(RTLD_DEFAULT, "aclrtHostUnregister"));
-    TORCH_CHECK(fn != nullptr, "aclrtHostUnregister is not available in this CANN runtime");
-    return fn;
-}
-
-void CheckRegistrableCpuBuf(const at::Tensor &buf)
-{
-    TORCH_CHECK(buf.is_cpu(), "aclrt_host_register: buf must be host (CPU) memory");
-    TORCH_CHECK(buf.nbytes() > 0, "aclrt_host_register: buf must be non-empty");
-    TORCH_CHECK(buf.data_ptr() != nullptr, "aclrt_host_register: buf must have a valid data_ptr");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(buf.data_ptr()) % 4096 == 0,
-                "aclrt_host_register: host address must be 4K aligned, got ", buf.data_ptr());
-}
 
 std::vector<HostRange>::iterator FindByHva(uintptr_t hva)
 {
@@ -131,44 +93,38 @@ int64_t ResolveHostDva(const void *host_ptr, uint64_t bytes)
     return dva;
 }
 
-HOST_API int64_t aclrt_host_register(const at::Tensor &buf)
+// Pure bookkeeping: the aclrtHostRegister(ACL_HOST_REGISTER_MAPPED) call itself
+// lives in python (host_memory.py, PR #39548's `acl.rt` binding path). This op
+// only publishes the page-aligned mapping {hva, span, base_dva} into the
+// process registry so the transfer ops' DVA resolver can find it. `hva` must be
+// the page-aligned registered base, `nbytes` the page-aligned span, `dva` the
+// device-visible address of `hva` (device_ptr minus the tensor's inner offset).
+HOST_API void aclrt_record_host_mapping(int64_t hva, int64_t nbytes, int64_t dva)
 {
-    CheckRegistrableCpuBuf(buf);
-    void *host_ptr = buf.data_ptr();
-    const uint64_t bytes = static_cast<uint64_t>(buf.nbytes());
-
-    void *dev_ptr = nullptr;
-    const int32_t ret = GetAclHostRegister()(host_ptr, bytes, ACL_HOST_REGISTER_MAPPED, &dev_ptr);
-    TORCH_CHECK(ret == 0 && dev_ptr != nullptr, "aclrtHostRegister failed, ret=", ret, " ptr=", host_ptr,
-                " bytes=", bytes, " (type=ACL_HOST_REGISTER_MAPPED=", static_cast<int32_t>(ACL_HOST_REGISTER_MAPPED),
-                ")");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(dev_ptr) != reinterpret_cast<uintptr_t>(host_ptr),
-                "aclrtHostRegister returned the host address unchanged; the mapping is not usable by AIV kernels");
-
-    {
-        std::lock_guard<std::mutex> lock(g_ranges_mu);
-        TORCH_CHECK(FindByHva(reinterpret_cast<uintptr_t>(host_ptr)) == g_ranges.end(),
-                    "aclrt_host_register: address ", host_ptr, " is already registered");
-        HostRange range{reinterpret_cast<uintptr_t>(host_ptr), bytes, reinterpret_cast<uintptr_t>(dev_ptr)};
-        g_ranges.insert(std::upper_bound(g_ranges.begin(), g_ranges.end(), range,
-                                         [](const HostRange &a, const HostRange &b) { return a.hva < b.hva; }),
-                        range);
+    TORCH_CHECK(hva > 0 && hva % 4096 == 0, "aclrt_record_host_mapping: hva must be a 4K-aligned registered base, got ",
+                hva);
+    TORCH_CHECK(nbytes > 0 && nbytes % 4096 == 0,
+                "aclrt_record_host_mapping: nbytes must be a positive 4K multiple, got ", nbytes);
+    TORCH_CHECK(dva > 0, "aclrt_record_host_mapping: dva must be non-zero, got ", dva);
+    HostRange range{static_cast<uintptr_t>(hva), static_cast<uint64_t>(nbytes), static_cast<uintptr_t>(dva)};
+    std::lock_guard<std::mutex> lock(g_ranges_mu);
+    auto it = FindByHva(range.hva);
+    if (it != g_ranges.end()) {
+        *it = range;  // re-registration of the same base replaces the entry
+        return;
     }
-    return static_cast<int64_t>(reinterpret_cast<uintptr_t>(dev_ptr));
+    g_ranges.insert(std::upper_bound(g_ranges.begin(), g_ranges.end(), range,
+                                     [](const HostRange &a, const HostRange &b) { return a.hva < b.hva; }),
+                    range);
 }
 
-HOST_API void aclrt_host_unregister(const at::Tensor &buf)
+HOST_API void aclrt_forget_host_mapping(int64_t hva)
 {
-    TORCH_CHECK(buf.is_cpu(), "aclrt_host_unregister: buf must be host (CPU) memory");
-    void *host_ptr = buf.data_ptr();
-    {
-        std::lock_guard<std::mutex> lock(g_ranges_mu);
-        auto it = FindByHva(reinterpret_cast<uintptr_t>(host_ptr));
-        TORCH_CHECK(it != g_ranges.end(), "aclrt_host_unregister: address ", host_ptr, " is not registered");
-        g_ranges.erase(it);
-    }
-    const int32_t ret = GetAclHostUnregister()(host_ptr);
-    TORCH_CHECK(ret == 0, "aclrtHostUnregister failed, ret=", ret, " ptr=", host_ptr);
+    std::lock_guard<std::mutex> lock(g_ranges_mu);
+    auto it = FindByHva(static_cast<uintptr_t>(hva));
+    TORCH_CHECK(it != g_ranges.end(), "aclrt_forget_host_mapping: address ",
+                reinterpret_cast<void *>(hva), " is not registered");
+    g_ranges.erase(it);
 }
 
 HOST_API int64_t aclrt_get_device_accessible_ptr(const at::Tensor &buf, int64_t device_index)

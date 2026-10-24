@@ -16,10 +16,10 @@ import time
 import torch
 
 from sgl_kernel_npu.kvcacheio import (
-    aclrt_host_register,
-    aclrt_host_unregister,
+    register_host_memory,
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_per_layer_direct_pf_lf,
+    unregister_host_memory,
 )
 
 # MLA geometry mirrors sglang pool_host/mla.py page_first_kv_split
@@ -51,13 +51,14 @@ def bench_h2d_per_layer(layers: int, pages: int, iters: int) -> None:
     dev_v = torch.zeros((layers, pages, PAGE_SIZE, 1, V_WIDTH), dtype=torch.bfloat16, device="npu")
     dev_idx, host_idx = _page_aligned_indices(pages, "npu")
 
-    aclrt_host_register(host_k)
-    aclrt_host_register(host_v)
+    mk = register_host_memory(host_k)
+    mv = register_host_memory(host_v)
     try:
         for _ in range(3):  # warmup
             for layer in range(layers):
                 transfer_kv_per_layer_direct_pf_lf(
-                    [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PAGE_SIZE)
+                    [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PAGE_SIZE,
+                    host_mappings=[mk, mv])
         torch.npu.synchronize()
 
         bytes_moved = layers * _pooled_bytes(1, pages, K_WIDTH)
@@ -66,7 +67,8 @@ def bench_h2d_per_layer(layers: int, pages: int, iters: int) -> None:
         for _ in range(iters):
             for layer in range(layers):
                 transfer_kv_per_layer_direct_pf_lf(
-                    [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PAGE_SIZE)
+                    [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PAGE_SIZE,
+                    host_mappings=[mk, mv])
         torch.npu.synchronize()
         elapsed = time.perf_counter() - start
 
@@ -74,8 +76,8 @@ def bench_h2d_per_layer(layers: int, pages: int, iters: int) -> None:
         print(f"H2D per-layer : {gbps:8.2f} GB/s  "
               f"({layers} layers x {pages} pages, {bytes_moved * iters / 1e9:.1f} GB in {elapsed * 1e3:.1f} ms)")
     finally:
-        aclrt_host_unregister(host_k)
-        aclrt_host_unregister(host_v)
+        unregister_host_memory(mk)
+        unregister_host_memory(mv)
 
 
 def bench_d2h_all_layer(layers: int, pages: int, iters: int) -> None:
@@ -86,19 +88,21 @@ def bench_d2h_all_layer(layers: int, pages: int, iters: int) -> None:
     dev_v = torch.randn((layers, pages, PAGE_SIZE, 1, V_WIDTH), device="npu").to(torch.bfloat16)
     dev_idx, host_idx = _page_aligned_indices(pages, "npu")
 
-    aclrt_host_register(host_k)
-    aclrt_host_register(host_v)
+    mk = register_host_memory(host_k)
+    mv = register_host_memory(host_v)
     try:
         for _ in range(3):  # warmup
             transfer_kv_all_layer_direct_lf_pf(
-                [dev_k, dev_v], [host_k, host_v], dev_idx, host_idx, PAGE_SIZE)
+                [dev_k, dev_v], [host_k, host_v], dev_idx, host_idx, PAGE_SIZE,
+                host_mappings=[mk, mv])
         torch.npu.synchronize()
 
         bytes_moved = _pooled_bytes(layers, pages, K_WIDTH) + _pooled_bytes(layers, pages, V_WIDTH)
         start = time.perf_counter()
         for _ in range(iters):
             transfer_kv_all_layer_direct_lf_pf(
-                [dev_k, dev_v], [host_k, host_v], dev_idx, host_idx, PAGE_SIZE)
+                [dev_k, dev_v], [host_k, host_v], dev_idx, host_idx, PAGE_SIZE,
+                host_mappings=[mk, mv])
         torch.npu.synchronize()
         elapsed = time.perf_counter() - start
 
@@ -106,8 +110,8 @@ def bench_d2h_all_layer(layers: int, pages: int, iters: int) -> None:
         print(f"D2H all-layer : {gbps:8.2f} GB/s  "
               f"({layers} layers x {pages} pages, {bytes_moved * iters / 1e9:.1f} GB in {elapsed * 1e3:.1f} ms)")
     finally:
-        aclrt_host_unregister(host_k)
-        aclrt_host_unregister(host_v)
+        unregister_host_memory(mk)
+        unregister_host_memory(mv)
 
 
 def main():

@@ -1,13 +1,15 @@
 /*
  * Process-level registry of aclrtHostRegister-ed host ranges.
  *
- * aclrt_host_register(buf) pins `buf` with aclrtHostRegister(4-arg,
- * ACL_HOST_REGISTER_MAPPED) and records {hva, size, dva}. Transfer ops call
- * ResolveHostDva() to translate a registered host tensor (e.g. an L2 KV cache
- * pool) into the device-visible address the AIV kernel dereferences.
+ * The aclrtHostRegister(4-arg, ACL_HOST_REGISTER_MAPPED) call itself lives in
+ * python (host_memory.py, PR #39548's `acl.rt` binding path); the
+ * aclrt_record_host_mapping op publishes each mapping {hva, size, dva} here.
+ * Transfer ops call ResolveHostDva() to translate a registered host tensor
+ * (e.g. an L2 KV cache pool) into the device-visible address the AIV kernel
+ * dereferences.
  *
- * There is deliberately no HAL fallback: on CANN builds without a working
- * aclrtHostRegister this fails loudly instead of silently taking a slow path.
+ * There is deliberately no HAL fallback: for host pointers never published
+ * here this fails loudly instead of silently taking a slow path.
  */
 
 #ifndef SGL_KERNEL_NPU_KV_EXCHANGE_ACLRT_HOST_REGISTRY_H
@@ -33,7 +35,7 @@ int64_t LookupHostDva(const void *host_ptr);
 // (declared in sgl_kenel_npu_ops.h):
 //   "aclrt"       (default) ResolveHostDva/LookupHostDva resolve through the
 //                 process aclrtHostRegister table populated by
-//                 aclrt_host_register()
+//                 aclrt_record_host_mapping()
 //   "passthrough" host pointers are already device-accessible; the registry
 //                 is bypassed
 // This is the seam where a future provider (e.g. a memfabric DVA resolver)

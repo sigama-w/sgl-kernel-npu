@@ -102,12 +102,14 @@ void CheckComponentPair(const at::Tensor &device_buf, const at::Tensor &host_buf
 //   per component c at 8 + 9*c: dev_base, host_base(DVA), dev_layer_pitch,
 //   dev_page_pitch, host_page_pitch, host_layer_pitch, width, layer_lo, layer_hi
 void FillComponent(std::vector<int64_t> &meta, int64_t c, const at::Tensor &device_buf, const at::Tensor &host_buf,
-                   int64_t layer_lo, int64_t layer_hi)
+                   int64_t layer_lo, int64_t layer_hi, int64_t explicit_host_dva)
 {
     const int64_t esz = device_buf.element_size();
     const int64_t o = kMetaHeader + kMetaStride * c;
     meta[o + 0] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(device_buf.data_ptr()));
-    meta[o + 1] = ResolveHostDva(host_buf.data_ptr(), host_buf.nbytes());
+    // PR #39548-style explicit mapping: the caller may hand the mapping's
+    // device_ptr directly (0 = resolve via the process registration table).
+    meta[o + 1] = explicit_host_dva != 0 ? explicit_host_dva : ResolveHostDva(host_buf.data_ptr(), host_buf.nbytes());
     meta[o + 2] = device_buf.stride(0) * esz;  // device_layer_pitch
     meta[o + 3] = device_buf.stride(1) * esz;  // device_page_pitch
     meta[o + 4] = host_buf.stride(0) * esz;    // host_page_pitch
@@ -165,18 +167,21 @@ HOST_API void kv_exchange(const at::Tensor &meta, int64_t block_dim)
 /*
  * H2D, one layer: host (page-first, 5-D) -> device (layer-first, 5-D).
  * src_ptrs are HOST pool components (k/v/index_k/...), dst_ptrs the matching
- * DEVICE components. Host memory must be registered via aclrt_host_register;
+ * DEVICE components. Host memory must be registered via register_host_memory;
  * the DVA resolution happens here, not on the caller side. Signatures mirror
  * sgl_kernel.kvcacheio (CUDA).
  */
 HOST_API void transfer_kv_per_layer_direct_pf_lf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
                                                  const at::Tensor &src_indices, const at::Tensor &dst_indices,
-                                                 int64_t layer_id, int64_t page_size)
+                                                 int64_t layer_id, int64_t page_size,
+                                                 const std::vector<int64_t> &host_dvas)
 {
     TORCH_CHECK(!src_ptrs.empty() && src_ptrs.size() == dst_ptrs.size(),
                 "src_ptrs and dst_ptrs must be non-empty lists of the same length");
     TORCH_CHECK(src_ptrs.size() <= kMaxComponents, "at most ", kMaxComponents, " components are supported, got ",
                 src_ptrs.size());
+    TORCH_CHECK(host_dvas.empty() || host_dvas.size() == src_ptrs.size(),
+                "host_dvas must be empty or match src_ptrs length, got ", host_dvas.size(), " vs ", src_ptrs.size());
     TORCH_CHECK(page_size > 0, "page_size must be positive, got ", page_size);
     TORCH_CHECK(layer_id >= 0, "layer_id must be non-negative, got ", layer_id);
 
@@ -214,7 +219,8 @@ HOST_API void transfer_kv_per_layer_direct_pf_lf(at::TensorList src_ptrs, at::Te
                     " with ", dst_ptrs[c].size(0), " device layers");
         TORCH_CHECK(layer_id < src_ptrs[c].size(1), "layer_id ", layer_id, " out of range for component ", c,
                     " with ", src_ptrs[c].size(1), " host layers");
-        FillComponent(meta, static_cast<int64_t>(c), dst_ptrs[c], src_ptrs[c], layer_id, layer_id + 1);
+        FillComponent(meta, static_cast<int64_t>(c), dst_ptrs[c], src_ptrs[c], layer_id, layer_id + 1,
+                      host_dvas.empty() ? 0 : host_dvas[c]);
     }
 
     LaunchKvExchange(meta, dst_ptrs[0]);
@@ -233,12 +239,14 @@ HOST_API void transfer_kv_per_layer_direct_pf_lf(at::TensorList src_ptrs, at::Te
  */
 HOST_API void transfer_kv_all_layer_direct_lf_pf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
                                                  const at::Tensor &src_indices, const at::Tensor &dst_indices,
-                                                 int64_t page_size)
+                                                 int64_t page_size, const std::vector<int64_t> &host_dvas)
 {
     TORCH_CHECK(!src_ptrs.empty() && src_ptrs.size() == dst_ptrs.size(),
                 "src_ptrs and dst_ptrs must be non-empty lists of the same length");
     TORCH_CHECK(src_ptrs.size() <= kMaxComponents, "at most ", kMaxComponents, " components are supported, got ",
                 src_ptrs.size());
+    TORCH_CHECK(host_dvas.empty() || host_dvas.size() == src_ptrs.size(),
+                "host_dvas must be empty or match src_ptrs length, got ", host_dvas.size(), " vs ", src_ptrs.size());
     TORCH_CHECK(page_size > 0, "page_size must be positive, got ", page_size);
 
     at::Tensor device_indices = src_indices;
@@ -273,7 +281,8 @@ HOST_API void transfer_kv_all_layer_direct_lf_pf(at::TensorList src_ptrs, at::Te
         CheckComponentPair(src_ptrs[c], dst_ptrs[c], page_size, static_cast<int64_t>(c));
         TORCH_CHECK(src_ptrs[c].size(0) <= dst_ptrs[c].size(1), "component ", c, ": device layer count ",
                     src_ptrs[c].size(0), " exceeds host layer count ", dst_ptrs[c].size(1));
-        FillComponent(meta, static_cast<int64_t>(c), src_ptrs[c], dst_ptrs[c], 0, src_ptrs[c].size(0));
+        FillComponent(meta, static_cast<int64_t>(c), src_ptrs[c], dst_ptrs[c], 0, src_ptrs[c].size(0),
+                      host_dvas.empty() ? 0 : host_dvas[c]);
     }
 
     LaunchKvExchange(meta, src_ptrs[0]);

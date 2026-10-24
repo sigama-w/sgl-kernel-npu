@@ -11,6 +11,9 @@
 #ifndef SGL_KERNEL_NPU_OPS_H
 #define SGL_KERNEL_NPU_OPS_H
 
+#include <tuple>
+#include <vector>
+
 namespace sglang {
 namespace npu_kernel {
 at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
@@ -67,11 +70,13 @@ void transfer_state_all_layer_direct_lf_pf(at::TensorList device_states,
                                            const at::Tensor &host_indices,
                                            int64_t flags);
 
-// AIV kv_exchange: register host memory / exchange KV pages between a
-// registered host pool and the device (see csrc/kv_exchange/op_host/).
-int64_t aclrt_host_register(const at::Tensor &buf);
+// AIV kv_exchange: exchange KV pages between a registered host pool and the
+// device (see csrc/kv_exchange/op_host/). The aclrtHostRegister call itself
+// lives in python (host_memory.py, PR #39548's `acl.rt` binding path); the C++
+// side only keeps the process bookkeeping table these ops maintain.
+void aclrt_record_host_mapping(int64_t hva, int64_t nbytes, int64_t dva);
 
-void aclrt_host_unregister(const at::Tensor &buf);
+void aclrt_forget_host_mapping(int64_t hva);
 
 int64_t aclrt_get_device_accessible_ptr(const at::Tensor &buf, int64_t device_index);
 
@@ -82,14 +87,17 @@ void aclrt_set_host_dva_mode(const std::string &mode);
 
 void kv_exchange(const at::Tensor &meta, int64_t block_dim);
 
+// host_dvas: optional per-component explicit DVA (PR-style HostMemoryMapping.
+// device_ptr); empty = resolve via the process registration table.
 void transfer_kv_per_layer_direct_pf_lf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
                                         const at::Tensor &src_indices,
                                         const at::Tensor &dst_indices, int64_t layer_id,
-                                        int64_t page_size);
+                                        int64_t page_size, const std::vector<int64_t> &host_dvas);
 
 void transfer_kv_all_layer_direct_lf_pf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
                                         const at::Tensor &src_indices,
-                                        const at::Tensor &dst_indices, int64_t page_size);
+                                        const at::Tensor &dst_indices, int64_t page_size,
+                                        const std::vector<int64_t> &host_dvas);
 
 at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
                        at::Tensor &y, int64_t slice_offset, int64_t slice_size);

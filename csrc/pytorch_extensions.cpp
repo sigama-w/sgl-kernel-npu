@@ -68,15 +68,17 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
 
     m.def(
         "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, "
-        "Tensor src_indices, Tensor dst_indices, int layer_id, int page_size) -> ()");
+        "Tensor src_indices, Tensor dst_indices, int layer_id, int page_size, "
+        "int[] host_dvas = []) -> ()");
 
     m.def(
         "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, "
-        "Tensor src_indices, Tensor dst_indices, int page_size) -> ()");
+        "Tensor src_indices, Tensor dst_indices, int page_size, "
+        "int[] host_dvas = []) -> ()");
 
-    m.def("aclrt_host_register(Tensor buf) -> int");
+    m.def("aclrt_record_host_mapping(int hva, int nbytes, int dva) -> ()");
 
-    m.def("aclrt_host_unregister(Tensor buf) -> ()");
+    m.def("aclrt_forget_host_mapping(int hva) -> ()");
 
     m.def("aclrt_get_device_accessible_ptr(Tensor buf, int device_index) -> int");
 
@@ -296,8 +298,8 @@ TORCH_LIBRARY_IMPL(npu, CatchAll, m)
 {
     // Host registration control-plane ops take CPU tensors, so PrivateUse1
     // dispatch cannot infer the backend from their inputs.
-    m.impl("aclrt_host_register", TORCH_FN(sglang::npu_kernel::aclrt_host_register));
-    m.impl("aclrt_host_unregister", TORCH_FN(sglang::npu_kernel::aclrt_host_unregister));
+    m.impl("aclrt_record_host_mapping", TORCH_FN(sglang::npu_kernel::aclrt_record_host_mapping));
+    m.impl("aclrt_forget_host_mapping", TORCH_FN(sglang::npu_kernel::aclrt_forget_host_mapping));
     m.impl("aclrt_get_device_accessible_ptr", TORCH_FN(sglang::npu_kernel::aclrt_get_device_accessible_ptr));
     m.impl("aclrt_set_host_dva_mode", TORCH_FN(sglang::npu_kernel::aclrt_set_host_dva_mode));
 }
