@@ -4,12 +4,17 @@
 # hugepage host allocator. The copy runs inside the AICPU device kernel launched
 # by torch.ops.npu.kv_exchange_aicpu.
 #
-# IMPORTANT: the AICPU stars subsystem cannot dereference host memory through a
-# registration DVA (rtsHostRegister channel is AIV-only on current CANN); the
-# working mechanism -- the one mf's aicpu mode uses -- is passing host VIRTUAL
-# addresses (HVA) directly: the kernel reads host indices / host cache via HVA
-# and device indices / device cache via device pointers. So meta carries HVAs
-# for all host-side fields and no aclrt_host_register call is needed here.
+# IMPORTANT: the AICPU stars sandbox cannot dereference HOST memory at all
+# (probe-verified on A3/950DT: device reads are fine, the first host HVA read
+# crashes the kernel -- exactly why mf's aicpu kernel never touches host
+# pointers and delegates the host leg to its transport engine). The working
+# pipeline stages the host leg through a device buffer using the driver DMA
+# (tensor.copy_ == aclrtMemcpy) and the kernel does pure D2D scatter/gather:
+#   H2D: host_buf --DMA--> staging_dev --AICPU D2D--> device pages
+#   D2H: device pages --AICPU D2D--> staging_dev --DMA--> host_buf
+# meta therefore carries DEVICE pointers in all "host-side" fields (they point
+# at the staging buffer, which mirrors the host layout geometry), and no
+# aclrt_host_register call is needed in this backend.
 #
 # Prerequisites (one-time, on the NPU device):
 #   1. Rebuild sgl-kernel-npu so sgl_kernel_npu.so contains kv_exchange_aicpu.
@@ -108,29 +113,34 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
         host_shape = (num_layers, num_tokens_host, head_dim)
     dev_shape = (num_layers, num_tokens_dev, head_dim)
 
-    # Indices: distinct token ids. Device indices live on device (read via
-    # device pointer); host indices live in pinned host memory (read via HVA).
+    # Indices: distinct token ids. The kernel reads BOTH index arrays from
+    # device memory; the staging-side indices mirror host_tok_ids and live in
+    # device memory next to the staging buffer.
     dev_tok_ids = torch.randperm(num_tokens_dev, device=device)[:num_indices].contiguous()
     host_tok_ids = torch.randperm(num_tokens_host).pin_memory().contiguous()
+    stage_tok_ids = host_tok_ids.to(device).contiguous()
 
     results = []
     host_holders = []
+    stage_bufs = []
     for _ in range(2):  # K and V
         dev_cache = torch.zeros(dev_shape, dtype=DTYPE, device=device)
         host_buf, holder = alloc_host_cache(host_shape)
+        staging = torch.empty(host_shape, dtype=DTYPE, device=device)  # device mirror of host_buf
         if direction == H2D:
             host_buf.copy_(torch.randint(1, 100, host_shape).to(DTYPE))
+            staging.copy_(host_buf, non_blocking=True)  # DMA: host -> staging (same layout)
         else:
             dev_cache = torch.randn(dev_shape, dtype=DTYPE, device=device).to(DTYPE)
-        hva = host_buf.data_ptr()
-        host_holders.append((host_buf, holder, hva))
+        host_holders.append((host_buf, holder))
+        stage_bufs.append(staging)
         results.append((dev_cache, host_buf))
 
     try:
         geoms = [
             {
                 "dev_base": dev_cache.data_ptr(),
-                "host_base": hva,
+                "host_base": staging.data_ptr(),  # staging is device memory
                 "dev_layer_pitch": dev_layer_pitch,
                 "dev_page_pitch": dev_page_pitch,
                 "host_page_pitch": host_page_pitch,
@@ -139,14 +149,18 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
                 "layer_lo": 0,
                 "layer_hi": num_layers,
             }
-            for dev_cache, (_, _, hva) in zip([r[0] for r in results], host_holders)
+            for dev_cache, staging in zip([r[0] for r in results], stage_bufs)
         ]
         meta = build_meta(2, num_indices, page_size, direction, layout,
-                          dev_tok_ids.data_ptr(), host_tok_ids.data_ptr(), geoms)
+                          dev_tok_ids.data_ptr(), stage_tok_ids.data_ptr(), geoms)
 
         # Keep every buffer alive across the async launch + sync.
-        keep_alive = [meta, dev_tok_ids, host_tok_ids] + [b for b, _, _ in host_holders] + [r[0] for r in results]
+        keep_alive = ([meta, dev_tok_ids, host_tok_ids, stage_tok_ids]
+                      + stage_bufs + [b for b, _ in host_holders] + [r[0] for r in results])
         torch.ops.npu.kv_exchange_aicpu(meta)
+        if direction == D2H:
+            for host_buf, staging in zip([b for b, _ in host_holders], stage_bufs):
+                host_buf.copy_(staging, non_blocking=True)  # DMA: staging -> host
         torch.npu.synchronize()
 
         dev_tok_cpu = dev_tok_ids.cpu()
@@ -228,8 +242,11 @@ def test_aicpu_probe(max_stage):
         return
     print(f"\n[max_stage={max_stage}] probe raw status: {[hex(v) if v else 0 for v in st[:13]]}")
     for slot, comp_slot, name in PROBE_STAGES:
-        ok = st[slot] == PROBE_MAGIC + slot and (comp_slot is None or st[comp_slot] != 0)
-        print(f"  [{'OK  ' if ok else 'FAIL'}] {name}")
+        # Stage OK = its magic was written. The companion value slot (comp_slot)
+        # is printed for reference only: a 0 there can be a legitimately read 0.
+        observed = hex(st[comp_slot]) if (comp_slot is not None and st[comp_slot]) else st[comp_slot]
+        ok = st[slot] == PROBE_MAGIC + slot
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {name} (observed={observed})")
     if err is not None:
         print(f"  launch/sync raised: {err}")
     if st[0] == 0:
