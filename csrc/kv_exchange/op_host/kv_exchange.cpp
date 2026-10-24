@@ -131,7 +131,8 @@ void LaunchKvExchange(std::vector<int64_t> &meta, const at::Tensor &device_ref)
                                     at::TensorOptions().dtype(at::kLong).device(device_ref.device()));
     meta_dev.copy_(at::from_blob(static_cast<void *>(meta.data()), {kMinMetaNumel}, at::TensorOptions().dtype(at::kLong)));
     meta_dev.record_stream(npuStream);
-    EXEC_KERNEL_CMD(kv_exchange, static_cast<uint32_t>(ResolveBlockDim()), meta_dev);
+    const uint32_t block_dim_u32 = ResolveBlockDim();
+    EXEC_KERNEL_CMD(kv_exchange, block_dim_u32, meta_dev);
 }
 
 }  // namespace
@@ -155,7 +156,10 @@ HOST_API void kv_exchange(const at::Tensor &meta, int64_t block_dim)
     const auto npuStream = c10_npu::getCurrentNPUStream();
     meta.record_stream(npuStream);
 
-    EXEC_KERNEL_CMD(kv_exchange, static_cast<uint32_t>(block_dim), meta);
+    // EXEC_KERNEL_CMD substitutes blockdim into a lambda capture list, so it
+    // must be a plain identifier, not a cast expression.
+    const uint32_t block_dim_u32 = static_cast<uint32_t>(block_dim);
+    EXEC_KERNEL_CMD(kv_exchange, block_dim_u32, meta);
 }
 
 /*
