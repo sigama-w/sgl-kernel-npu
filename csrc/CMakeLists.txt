@@ -64,7 +64,6 @@ set(OP_SRCS
     ${PROJECT_OP_SRC_BASE}/transfer_mamba_state/op_host/transfer_mamba_state.cpp
     ${PROJECT_OP_SRC_BASE}/transfer_state_dim_exchange/op_host/transfer_state_dim_exchange.cpp
     ${PROJECT_OP_SRC_BASE}/kv_exchange/op_host/kv_exchange.cpp
-    ${PROJECT_OP_SRC_BASE}/kv_exchange/op_host/aclrt_host_register.cpp
     ${PROJECT_OP_SRC_BASE}/lora/op_host/bgmv_expand.cpp
     ${PROJECT_OP_SRC_BASE}/lora/op_host/bgmv_shrink.cpp
     ${PROJECT_OP_SRC_BASE}/lora/op_host/sgmv_expand.cpp

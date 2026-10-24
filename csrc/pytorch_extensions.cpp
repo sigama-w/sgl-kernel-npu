@@ -76,12 +76,6 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor src_indices, Tensor dst_indices, int page_size, "
         "int[] host_dvas = []) -> ()");
 
-    m.def("aclrt_record_host_mapping(int hva, int nbytes, int dva) -> ()");
-
-    m.def("aclrt_forget_host_mapping(int hva) -> ()");
-
-    m.def("aclrt_get_device_accessible_ptr(Tensor buf, int device_index) -> int");
-
     m.def("aclrt_set_host_dva_mode(str mode) -> ()");
 
     m.def(
@@ -296,11 +290,8 @@ TORCH_LIBRARY_IMPL(npu, CatchAll, m)
 
 TORCH_LIBRARY_IMPL(npu, CatchAll, m)
 {
-    // Host registration control-plane ops take CPU tensors, so PrivateUse1
-    // dispatch cannot infer the backend from their inputs.
-    m.impl("aclrt_record_host_mapping", TORCH_FN(sglang::npu_kernel::aclrt_record_host_mapping));
-    m.impl("aclrt_forget_host_mapping", TORCH_FN(sglang::npu_kernel::aclrt_forget_host_mapping));
-    m.impl("aclrt_get_device_accessible_ptr", TORCH_FN(sglang::npu_kernel::aclrt_get_device_accessible_ptr));
+    // The host-address provider control op takes no tensor input, so
+    // PrivateUse1 dispatch cannot infer the backend from its arguments.
     m.impl("aclrt_set_host_dva_mode", TORCH_FN(sglang::npu_kernel::aclrt_set_host_dva_mode));
 }
 

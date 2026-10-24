@@ -11,15 +11,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "aclrt_host_registry.h"
-
 #include "defines.h"
 #include "torch_helper.h"
 
 #include "aclrtlaunch_kv_exchange.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace sglang {
@@ -96,6 +96,30 @@ void CheckComponentPair(const at::Tensor &device_buf, const at::Tensor &host_buf
                 "(page, layer) block)");
 }
 
+// Host-address provider mode, selected via aclrt_set_host_dva_mode() below:
+//   false = "aclrt" (default) python resolves host pool pointers through its
+//           acl.rt mapping table and passes explicit DVAs to the transfer ops
+//   true  = "passthrough" host pointers are already device-accessible
+// Registration itself lives entirely in python (host_memory.py, PR #39548's
+// `acl.rt` binding path); this flag only steers the fallback resolver below.
+std::atomic<bool> g_passthrough{false};
+
+// Fallback translator for host pointers reaching the transfer ops without an
+// explicit DVA: returns the raw address in "passthrough" mode, throws
+// c10::Error in "aclrt" mode (the pointer was never registered).
+int64_t ResolveHostDva(const void *host_ptr, uint64_t bytes)
+{
+    (void)bytes;
+    if (g_passthrough.load(std::memory_order_relaxed)) {
+        return static_cast<int64_t>(reinterpret_cast<uintptr_t>(host_ptr));
+    }
+    TORCH_CHECK(false, "host address ", host_ptr,
+                " is not registered with aclrtHostRegister; "
+                "allocate host pools via sglang pool_host alloc_with_host_register (NPU) so the "
+                "AIV kv_exchange kernel can dereference them");
+    return 0;
+}
+
 // meta layout (see op_kernel/kv_exchange_kernel.cpp):
 //   [0] num_components [1] num_pages [2] page_size [3] direction
 //   [4] device_indices_ptr [5] host_indices_ptr [6] host_layout_mode [7] start_dim
@@ -108,7 +132,8 @@ void FillComponent(std::vector<int64_t> &meta, int64_t c, const at::Tensor &devi
     const int64_t o = kMetaHeader + kMetaStride * c;
     meta[o + 0] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(device_buf.data_ptr()));
     // PR #39548-style explicit mapping: the caller may hand the mapping's
-    // device_ptr directly (0 = resolve via the process registration table).
+    // device_ptr directly (0 = the aclrt-mode fallback below fails loudly for
+    // unregistered host pointers).
     meta[o + 1] = explicit_host_dva != 0 ? explicit_host_dva : ResolveHostDva(host_buf.data_ptr(), host_buf.nbytes());
     meta[o + 2] = device_buf.stride(0) * esz;  // device_layer_pitch
     meta[o + 3] = device_buf.stride(1) * esz;  // device_page_pitch
@@ -291,6 +316,21 @@ HOST_API void transfer_kv_all_layer_direct_lf_pf(at::TensorList src_ptrs, at::Te
     }
     device_indices.record_stream(c10_npu::getCurrentNPUStream());
     host_indices.record_stream(c10_npu::getCurrentNPUStream());
+}
+
+// Select the host-address provider for the transfer ops (mirror of the python
+// set_host_dva_mode): "aclrt" (default) or "passthrough". This is the seam
+// where a future provider (e.g. a memfabric DVA resolver) plugs in.
+HOST_API void aclrt_set_host_dva_mode(const std::string &mode)
+{
+    if (mode == "aclrt") {
+        g_passthrough.store(false, std::memory_order_relaxed);
+    } else if (mode == "passthrough") {
+        g_passthrough.store(true, std::memory_order_relaxed);
+    } else {
+        TORCH_CHECK(false, "aclrt_set_host_dva_mode: unknown mode '", mode,
+                    "' (expected 'aclrt' or 'passthrough')");
+    }
 }
 
 }  // namespace npu_kernel

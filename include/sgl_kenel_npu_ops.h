@@ -72,13 +72,8 @@ void transfer_state_all_layer_direct_lf_pf(at::TensorList device_states,
 
 // AIV kv_exchange: exchange KV pages between a registered host pool and the
 // device (see csrc/kv_exchange/op_host/). The aclrtHostRegister call itself
-// lives in python (host_memory.py, PR #39548's `acl.rt` binding path); the C++
-// side only keeps the process bookkeeping table these ops maintain.
-void aclrt_record_host_mapping(int64_t hva, int64_t nbytes, int64_t dva);
-
-void aclrt_forget_host_mapping(int64_t hva);
-
-int64_t aclrt_get_device_accessible_ptr(const at::Tensor &buf, int64_t device_index);
+// lives in python (host_memory.py, PR #39548's `acl.rt` binding path); the
+// transfer ops receive explicit DVAs through their `host_dvas` argument.
 
 // Select the host-address provider for the kv_exchange transfer ops:
 // "aclrt" (default) or "passthrough" (host pointers already device-accessible;
