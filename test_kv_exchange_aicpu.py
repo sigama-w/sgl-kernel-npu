@@ -170,6 +170,66 @@ def test_kv_exchange_aicpu(direction, layout, page_size):
         pass  # pinned buffers are freed by GC; no registration to undo
 
 
+PROBE_MAGIC = 0x41435030  # "ACP0", must match kProbeMagicBase in the kernel
+
+PROBE_STAGES = [
+    (0, None, "S0 kernel running / param+meta readable"),
+    (1, 9, "S1 read device_indices (device memory)"),
+    (2, 10, "S2 read device_base byte (device data)"),
+    (3, 11, "S3 read host_indices (host HVA)"),
+    (4, 12, "S4 read host_base byte (host data)"),
+    (5, None, "S5 all probes completed"),
+]
+
+
+@pytest.mark.skipif(not (HAS_NPU and HAS_OPS), reason="torch_npu or kv_exchange_aicpu op not available")
+def test_aicpu_probe():
+    """Diagnostic: which address spaces can the AICPU stars sandbox touch?
+
+    Run alone on a fresh process (it may crash the device on host accesses):
+        pytest test_kv_exchange_aicpu.py::test_aicpu_probe -v -s
+    """
+    device = "npu"
+    status = torch.zeros(16, dtype=torch.int32, device=device)
+    dev_idx = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device)
+    host_idx = torch.tensor([5, 6, 7, 8], dtype=torch.int64).pin_memory()
+    dev_cache = torch.full((64,), 1.0, dtype=DTYPE, device=device)
+    host_buf = torch.full((64,), 1.0, dtype=DTYPE).pin_memory()
+
+    meta = [0] * 44
+    meta[0] = 1  # num_components
+    meta[1] = 4  # num_indices (echoed back at status[8])
+    meta[2] = 1  # page_size
+    meta[3] = 0  # direction 0 = PROBE
+    meta[4] = dev_idx.data_ptr()
+    meta[5] = host_idx.data_ptr()
+    meta[6] = 0
+    meta[7] = status.data_ptr()
+    meta[8] = dev_cache.data_ptr()
+    meta[9] = host_buf.data_ptr()
+    meta_t = torch.tensor(meta, dtype=torch.int64)
+
+    err = None
+    try:
+        torch.ops.npu.kv_exchange_aicpu(meta_t)
+        torch.npu.synchronize()
+    except Exception as e:  # noqa: BLE001
+        err = e
+
+    st = status.cpu().tolist()
+    print(f"\nprobe raw status: {[hex(v) if v else 0 for v in st[:13]]}")
+    for slot, comp_slot, name in PROBE_STAGES:
+        ok = st[slot] == PROBE_MAGIC + slot and (comp_slot is None or st[comp_slot] != 0)
+        print(f"  [{'OK  ' if ok else 'FAIL'}] {name}")
+    if err is not None:
+        print(f"  launch/sync raised: {err}")
+    if st[0] == 0:
+        print("  ==> status[0] never written: the kernel never ran or never saw a valid param "
+              "(args staging / rtsHostRegister layer is broken)")
+    print("  ==> interpretation: the FAILed stage right after the last OK stage is the "
+          "address class the AICPU sandbox cannot dereference")
+
+
 def _gather_host(host_buf, layout, num_layers, tok_ids, page_size, head_dim):
     """Return per-layer [num_indices, head_dim] slices from a host cache tensor."""
     tok_ids = tok_ids.long()

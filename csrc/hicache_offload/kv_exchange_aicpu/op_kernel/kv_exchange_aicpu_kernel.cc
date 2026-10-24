@@ -17,11 +17,23 @@
  *   [0] num_components        1..4 (e.g. K and V count as 2)
  *   [1] num_indices           number of token slots to copy
  *   [2] page_size             tokens per page
- *   [3] direction             1 = H2D, 2 = D2H
+ *   [3] direction             0 = probe, 1 = H2D, 2 = D2H
  *   [4] device_indices_ptr    DVA of int64 token indices into device cache
  *   [5] host_indices_ptr      DVA of int64 token indices into host cache
  *   [6] host_layout_mode      0 = page_first, 1 = layer_first
- *   [7] reserved              must be 0
+ *   [7] probe only: device int32 status buffer (>=16 slots)
+ *
+ *   PROBE MODE (direction=0): answers "which address spaces can this AICPU
+ *   stars sandbox dereference?" by touching one address per stage and writing
+ *   a stage magic BEFORE the access plus the observed value AFTER it. A crash
+ *   therefore leaves the highest magic without its companion value:
+ *     status[0]=M+0 always (kernel running, meta readable)
+ *     status[1]=M+1 then status[9]=device_indices[0]      (device mem read)
+ *     status[2]=M+2 then status[10]=device_base[0] byte   (device data read)
+ *     status[3]=M+3 then status[11]=host_indices[0]       (host HVA read)
+ *     status[4]=M+4 then status[12]=host_base[0] byte     (host data read)
+ *     status[5]=M+5 all probes completed
+ *
  *   per component c (base = 8 + 9*c):
  *   +0 device_base            DVA of the device KV tensor for this component
  *   +1 host_base              DVA of the registered host KV tensor
@@ -64,10 +76,14 @@ constexpr int kCompWidth = 6;
 constexpr int kCompLayerLo = 7;
 constexpr int kCompLayerHi = 8;
 
+constexpr int64_t kDirectionProbe = 0;
 constexpr int64_t kDirectionH2D = 1;
 constexpr int64_t kDirectionD2H = 2;
 constexpr int64_t kLayoutPageFirst = 0;
 constexpr int64_t kLayoutLayerFirst = 1;
+
+constexpr int kMetaProbeStatusPtr = 7;
+constexpr int32_t kProbeMagicBase = 0x41435030; // "ACP0"
 
 // error codes (kept non-zero and coarse; host side only needs pass/fail)
 constexpr int32_t kRetOk = 0;
@@ -86,6 +102,31 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
         return kRetInvalidParam;
     }
     const int64_t *meta = param->meta;
+
+    if (meta[kMetaDirection] == kDirectionProbe) {
+        // Probe mode: touch one address per stage. Write the stage magic
+        // BEFORE the access and the observed value AFTER it, so a crash
+        // leaves the highest magic without its companion value.
+        volatile int32_t *status = reinterpret_cast<volatile int32_t *>(meta[kMetaProbeStatusPtr]);
+        const int64_t *devIdx = reinterpret_cast<const int64_t *>(meta[kMetaDeviceIndicesPtr]);
+        const int64_t *hostIdx = reinterpret_cast<const int64_t *>(meta[kMetaHostIndicesPtr]);
+        const int64_t *comp = meta + 8;
+        const uint8_t *devBase = reinterpret_cast<const uint8_t *>(comp[0]);
+        const uint8_t *hostBase = reinterpret_cast<const uint8_t *>(comp[1]);
+
+        status[0] = kProbeMagicBase + 0; // kernel running, param/meta readable
+        status[8] = static_cast<int32_t>(meta[kMetaNumIndices]);
+        status[1] = kProbeMagicBase + 1; // about to read device memory
+        status[9] = static_cast<int32_t>(devIdx[0]);
+        status[2] = kProbeMagicBase + 2; // about to read device data
+        status[10] = static_cast<int32_t>(devBase[0]);
+        status[3] = kProbeMagicBase + 3; // about to read host HVA
+        status[11] = static_cast<int32_t>(hostIdx[0]);
+        status[4] = kProbeMagicBase + 4; // about to read host data
+        status[12] = static_cast<int32_t>(hostBase[0]);
+        status[5] = kProbeMagicBase + 5; // all probes completed
+        return kRetOk;
+    }
 
     const int64_t numComponents = meta[kMetaNumComponents];
     const int64_t numIndices = meta[kMetaNumIndices];
