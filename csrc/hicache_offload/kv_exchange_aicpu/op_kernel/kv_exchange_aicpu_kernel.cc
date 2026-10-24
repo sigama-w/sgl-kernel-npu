@@ -126,7 +126,7 @@ extern "C" int32_t KvExchangeAicpu(KvExchangeAicpuParam *param)
         dlog_error(static_cast<int32_t>(APP),
                    "[KVX] probe S0 enter param=%p status=%p stageLimit=%d nIdx=%d devIdx=%p hostIdx=%p "
                    "devBase=%p hostBase=%p meta4=%lx meta5=%lx meta8=%lx meta9=%lx",
-                   static_cast<const void *>(param), static_cast<const void *>(status),
+                   static_cast<const void *>(param), static_cast<const void *>(const_cast<int32_t *>(status)),
                    static_cast<int>(stageLimit), static_cast<int>(meta[kMetaNumIndices]),
                    static_cast<const void *>(devIdx), static_cast<const void *>(hostIdx),
                    static_cast<const void *>(devBase), static_cast<const void *>(hostBase),
