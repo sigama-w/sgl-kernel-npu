@@ -42,8 +42,12 @@ fi
 mkdir -p "${BUILD_DIR}"
 
 echo "---- compile libcann_kv_exchange_kernel.so ----"
+DLOG_FLAGS=""
+if [ "${SGL_KVX_DLOG}" = "1" ]; then
+    DLOG_FLAGS="-DSGL_KVX_ENABLE_DLOG -I${ASCEND_HOME_PATH}/pkg_inc/base"
+fi
 "${CROSS_GXX}" -shared -O2 -std=c++17 -fPIC \
-    -I"${ASCEND_HOME_PATH}/pkg_inc/base" \
+    ${DLOG_FLAGS} \
     -o "${BUILD_DIR}/libcann_kv_exchange_kernel.so" \
     "${OP_DIR}/kv_exchange_aicpu_kernel.cc"
 
