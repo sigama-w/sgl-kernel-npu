@@ -125,7 +125,8 @@ int64_t ResolveHostDva(const void *host_ptr, uint64_t bytes)
         return static_cast<int64_t>(reinterpret_cast<uintptr_t>(host_ptr));
     }
     void *dva = nullptr;
-    const aclError ret = aclrtHostGetDevicePointer(const_cast<void *>(host_ptr), &dva);
+    // flag is reserved (0 = default lookup), per acl_rt.h (CANN >= 9.0).
+    const aclError ret = aclrtHostGetDevicePointer(const_cast<void *>(host_ptr), &dva, 0);
     TORCH_CHECK(ret == 0 && dva != nullptr, "aclrtHostGetDevicePointer failed for host address ", host_ptr,
                 " (ret=", static_cast<int>(ret), "); the host pool was not registered with "
                 "aclrtHostRegister -- allocate host pools via sglang pool_host "
