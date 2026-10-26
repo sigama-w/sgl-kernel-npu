@@ -10,15 +10,16 @@ from sgl_kernel_npu.kvcacheio import (
 )
 
 # Case matrix mirrors test_transfer_kv_dim_exchange.py (kv / kv+index_k / k /
-# scale x D2H/H2D), adapted to the production entry points: H2D = per-layer
-# loop (mla.py load_to_device_per_layer), D2H = all-layer single call (mla.py
-# backup_from_device_all_layer). Verification is element-wise per (page,
-# layer) block -- stronger than dim_exchange's sum-based kv checks.
+# scale x D2H/H2D). Every call spells out formal=actual keyword arguments, so
+# the operator signature reads like the dim_exchange calls. H2D goes through
+# transfer_kv_per_layer_direct_pf_lf (mla.py load_to_device_per_layer), D2H
+# through transfer_kv_all_layer_direct_lf_pf (mla.py
+# backup_from_device_all_layer).
 #
-# Geometry mirrors sglang pool_host/mla.py page_first_kv_split (MLA host pool):
-# host (pages, layers, page_size, 1, width) page-first, device (layers, pages,
-# page_size, 1, width) layer-first. The quantized-Indexer k and its FP32 scale
-# cover a subset of layers, like dim_exchange's index_k/scale components.
+# Layouts (MLA host pool, page_first_kv_split):
+#   host   page-first  (pages, layers, page_size, 1, width)  pinned+registered
+#   device layer-first (layers, pages, page_size, 1, width)
+# The quantized-Indexer k and its FP32 scale cover a subset of layers.
 PAGES = 8
 LAYERS = 4
 PS = 128  # page_size
@@ -26,14 +27,6 @@ K_WIDTH = 656  # kv_lora_rank
 V_WIDTH = 64  # qk_rope_head_dim
 IDX_LAYERS = 2  # indexer-style components cover fewer layers than the pool
 IDX_WIDTH = 128  # quantized-Indexer k width
-
-# name -> (host shape (page-first), dtype, component layer count)
-POOL_SPECS = {
-    "k": ((PAGES, LAYERS, PS, 1, K_WIDTH), torch.bfloat16, LAYERS),
-    "v": ((PAGES, LAYERS, PS, 1, V_WIDTH), torch.bfloat16, LAYERS),
-    "index_k": ((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH), torch.bfloat16, IDX_LAYERS),
-    "scale": ((PAGES, IDX_LAYERS, PS, 1, 1), torch.float32, IDX_LAYERS),
-}
 
 
 def _unique_like(shape):
@@ -43,9 +36,8 @@ def _unique_like(shape):
     - 128: unique per (page, layer) block (PAGES * LAYERS * 4 <= 256) with a
     per-token ripple. Any misdirected write -- wrong page, layer, token or an
     overrun row width -- changes values at the affected positions, so the
-    element-wise comparisons catch it; iid random data could hide a wrong
-    write that a later transfer overwrites (ref:
-    test_transfer_kv_dim_exchange.py's per-(layer, page) scale test).
+    element-wise comparisons catch it (ref: dim_exchange's per-(layer, page)
+    scale test philosophy).
     """
     pages, layers, ps = shape[0], shape[1], shape[2]
     assert pages * layers * 4 <= 256, "block ids must stay unique and bf16-exact"
@@ -69,10 +61,8 @@ def _page_pairs():
 
     The kernel transfers WHOLE (page, layer) blocks: it derives both page
     numbers from the first token of each transfer slot (idx[p*PS] // PS). Slot
-    indices must therefore be page-aligned token indices with a distinct page
-    per slot -- exactly the production contract (hicache token indices are
-    page*page_size + offset, grouped page by page). Random token permutations
-    would alias pages across slots and corrupt the comparison.
+    indices must be page-aligned token indices with a distinct page per slot
+    (hicache token indices are page*page_size + offset, grouped page by page).
     """
     offset = torch.arange(PS, dtype=torch.int64).repeat(PAGES)
     dev_pages = torch.randperm(PAGES, dtype=torch.int64)
@@ -84,8 +74,8 @@ def _page_pairs():
 
 class TestKvExchangeAclrt(unittest.TestCase):
 
-    def _check_pages(self, host, dev, dev_idx, host_idx, host_layer, dev_layer):
-        """host[host_page, host_layer] == dev[dev_layer, dev_page] per page pair."""
+    def _verify_pages(self, host, dev, dev_idx, host_idx, host_layer, dev_layer):
+        """Element-wise: host[host_page, host_layer] == dev[dev_layer, dev_page]."""
         for p in range(PAGES):
             dev_page = int(dev_idx[p * PS]) // PS
             host_page = int(host_idx[p * PS]) // PS
@@ -95,113 +85,291 @@ class TestKvExchangeAclrt(unittest.TestCase):
                 msg=f"mismatch dev_layer={dev_layer} host_layer={host_layer} page={p}",
             )
 
-    def _run_case(self, direction, names):
-        """Build + transfer + verify one matrix cell.
+    def _verify_all_layers(self, host, dev, dev_idx, host_idx, layers):
+        for layer in range(layers):
+            self._verify_pages(host, dev, dev_idx, host_idx, layer, layer)
 
-        direction: 'H2D' -> per-layer loop through
-        transfer_kv_per_layer_direct_pf_lf; 'D2H' -> single all-layer call
-        through transfer_kv_all_layer_direct_lf_pf. Components with different
-        layer counts (k/v vs index_k/scale) are transferred in separate
-        per-layer loops, mirroring mla.py's mapped layer ids.
-        """
-        torch.npu.set_device(0)
-        comps = []
-        for name in names:
-            shape, dtype, n_layers = POOL_SPECS[name]
-            host, mapping = _host_pool(shape, dtype)
-            if direction == "D2H":
-                # Host is the destination: zero it; the device source carries
-                # the same unique values (page-first permuted to layer-first).
-                host.zero_()
-                dev = (
-                    _unique_like(shape).permute(1, 0, 2, 3, 4)
-                    .contiguous().to(dtype).to("npu")
-                )
-            else:
-                # Host is the source (unique values); device starts zeroed so
-                # not-yet-transferred regions can be checked to stay zero.
-                dev = torch.zeros(
-                    (n_layers, shape[0]) + shape[2:], dtype=dtype, device="npu"
-                )
-            comps.append((name, host, mapping, dev, n_layers))
-        dev_idx, host_idx = _page_pairs()
-        try:
-            if direction == "D2H":
-                transfer_kv_all_layer_direct_lf_pf(
-                    [dev for _, _, _, dev, _ in comps],
-                    [host for _, host, _, _, _ in comps],
-                    dev_idx,
-                    host_idx,
-                    PS,
-                    host_mappings=[m for _, _, m, _, _ in comps],
-                )
-                torch.npu.synchronize()
-                for name, host, _, dev, n_layers in comps:
-                    for layer in range(n_layers):
-                        self._check_pages(host, dev, dev_idx, host_idx, layer, layer)
-            else:
-                for group_layers in sorted({c[4] for c in comps}, reverse=True):
-                    members = [c for c in comps if c[4] == group_layers]
-                    for layer in range(group_layers):
-                        transfer_kv_per_layer_direct_pf_lf(
-                            [host for _, host, _, _, _ in members],
-                            [dev for _, _, _, dev, _ in members],
-                            host_idx,
-                            dev_idx,
-                            layer,
-                            PS,
-                            host_mappings=[m for _, _, m, _, _ in members],
-                        )
-                        torch.npu.synchronize()
-                        # Verify right after each layer: a write aimed at this
-                        # layer but landing on a not-yet-transferred one would
-                        # be overwritten (and masked) by the next call if only
-                        # the final state were checked.
-                        for name, host, _, dev, _ in members:
-                            self._check_pages(host, dev, dev_idx, host_idx, layer, layer)
-                            for untouched in range(layer + 1, group_layers):
-                                self.assertEqual(
-                                    int(torch.count_nonzero(dev[untouched])),
-                                    0,
-                                    msg=f"{name}: layer {untouched} polluted by "
-                                    f"layer {layer}'s transfer",
-                                )
-        finally:
-            for _, _, mapping, _, _ in comps:
-                unregister_host_memory(mapping)
+    def _verify_untouched_zero(self, dev, layer, name):
+        """Layers after `layer` must still be all zero during an H2D loop."""
+        for untouched in range(layer + 1, LAYERS):
+            self.assertEqual(
+                int(torch.count_nonzero(dev[untouched])),
+                0,
+                msg=f"{name}: layer {untouched} polluted by layer {layer}'s transfer",
+            )
 
-    def test_kv_copy_d2h(self):
-        """k + v, all-layer D2H (dim_exchange test_kv_copy_d2h)."""
-        self._run_case("D2H", ["k", "v"])
+    # ------------------- H2D: per-layer load (mla.py) -------------------
+    #
+    # transfer_kv_per_layer_direct_pf_lf(
+    #     src_ptrs,       # host page-first pools (k/v/index_k/scale lists)
+    #     dst_ptrs,       # device layer-first pools
+    #     src_indices,    # host token indices,  page*PS + slot
+    #     dst_indices,    # device token indices (same token count)
+    #     layer_id,       # which layer this call transfers
+    #     page_size,      # PS
+    #     host_mappings,  # per-component HostMemoryMapping (host DVA bases)
+    # )
 
     def test_kv_copy_h2d(self):
         """k + v, per-layer H2D (dim_exchange test_kv_copy_h2d)."""
-        self._run_case("H2D", ["k", "v"])
-
-    def test_kv_index_k_copy_d2h(self):
-        """k + v + index_k, all-layer D2H (dim_exchange test_kv_index_k_copy_d2h)."""
-        self._run_case("D2H", ["k", "v", "index_k"])
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        dev_k = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_v = torch.zeros((LAYERS, PAGES, PS, 1, V_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_idx, host_idx = _page_pairs()
+        try:
+            for layer in range(LAYERS):
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[host_k, host_v],
+                    dst_ptrs=[dev_k, dev_v],
+                    src_indices=host_idx,
+                    dst_indices=dev_idx,
+                    layer_id=layer,
+                    page_size=PS,
+                    host_mappings=[mk, mv],
+                )
+                torch.npu.synchronize()
+                # Verify right after each layer: a write aimed at this layer
+                # but landing on a not-yet-transferred one would be masked by
+                # the next call if only the final state were checked.
+                self._verify_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
+                self._verify_pages(host_v, dev_v, dev_idx, host_idx, layer, layer)
+                self._verify_untouched_zero(dev_k, layer, "dev_k")
+                self._verify_untouched_zero(dev_v, layer, "dev_v")
+        finally:
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
 
     def test_kv_index_k_copy_h2d(self):
-        """k + v + index_k (subset layers), per-layer H2D
-        (dim_exchange test_kv_index_k_copy_h2d, plus layer-count mapping)."""
-        self._run_case("H2D", ["k", "v", "index_k"])
+        """k + v + index_k, per-layer H2D (dim_exchange test_kv_index_k_copy_h2d).
 
-    def test_k_copy_d2h(self):
-        """k only, all-layer D2H (dim_exchange test_k_copy_d2h)."""
-        self._run_case("D2H", ["k"])
+        index_k covers IDX_LAYERS (< LAYERS) layers, so it is transferred in
+        its own loop under its own layer ids -- the mla.py mapped-layer-id
+        semantics.
+        """
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        host_idx_k, mik = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
+        dev_k = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_v = torch.zeros((LAYERS, PAGES, PS, 1, V_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_idx_k = torch.zeros((IDX_LAYERS, PAGES, PS, 1, IDX_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_idx, host_idx = _page_pairs()
+        try:
+            for layer in range(LAYERS):
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[host_k, host_v],
+                    dst_ptrs=[dev_k, dev_v],
+                    src_indices=host_idx,
+                    dst_indices=dev_idx,
+                    layer_id=layer,
+                    page_size=PS,
+                    host_mappings=[mk, mv],
+                )
+                torch.npu.synchronize()
+                self._verify_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
+                self._verify_pages(host_v, dev_v, dev_idx, host_idx, layer, layer)
+                self._verify_untouched_zero(dev_k, layer, "dev_k")
+                self._verify_untouched_zero(dev_v, layer, "dev_v")
+            for idx_layer in range(IDX_LAYERS):
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[host_idx_k],
+                    dst_ptrs=[dev_idx_k],
+                    src_indices=host_idx,
+                    dst_indices=dev_idx,
+                    layer_id=idx_layer,  # index_k's own (smaller) layer id space
+                    page_size=PS,
+                    host_mappings=[mik],
+                )
+                torch.npu.synchronize()
+                self._verify_pages(host_idx_k, dev_idx_k, dev_idx, host_idx, idx_layer, idx_layer)
+        finally:
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
+            unregister_host_memory(mik)
 
     def test_k_copy_h2d(self):
         """k only, per-layer H2D (dim_exchange test_k_copy_h2d)."""
-        self._run_case("H2D", ["k"])
-
-    def test_scale_copy_d2h(self):
-        """FP32 scale only, all-layer D2H (dim_exchange test_scale_copy_d2h)."""
-        self._run_case("D2H", ["scale"])
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        dev_k = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_idx, host_idx = _page_pairs()
+        try:
+            for layer in range(LAYERS):
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[host_k],
+                    dst_ptrs=[dev_k],
+                    src_indices=host_idx,
+                    dst_indices=dev_idx,
+                    layer_id=layer,
+                    page_size=PS,
+                    host_mappings=[mk],
+                )
+                torch.npu.synchronize()
+                self._verify_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
+                self._verify_untouched_zero(dev_k, layer, "dev_k")
+        finally:
+            unregister_host_memory(mk)
 
     def test_scale_copy_h2d(self):
         """FP32 scale only, per-layer H2D (dim_exchange test_scale_copy_h2d)."""
-        self._run_case("H2D", ["scale"])
+        torch.npu.set_device(0)
+        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1, 1), dtype=torch.float32)
+        dev_scale = torch.zeros((IDX_LAYERS, PAGES, PS, 1, 1), dtype=torch.float32, device="npu")
+        dev_idx, host_idx = _page_pairs()
+        try:
+            for idx_layer in range(IDX_LAYERS):
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[host_scale],
+                    dst_ptrs=[dev_scale],
+                    src_indices=host_idx,
+                    dst_indices=dev_idx,
+                    layer_id=idx_layer,
+                    page_size=PS,
+                    host_mappings=[msc],
+                )
+                torch.npu.synchronize()
+                self._verify_pages(host_scale, dev_scale, dev_idx, host_idx, idx_layer, idx_layer)
+        finally:
+            unregister_host_memory(msc)
+
+    # ------------- D2H: all-layer single-call backup (mla.py) -------------
+    #
+    # transfer_kv_all_layer_direct_lf_pf(
+    #     src_ptrs,       # device layer-first pools
+    #     dst_ptrs,       # host page-first pools
+    #     src_indices,    # device token indices
+    #     dst_indices,    # host token indices
+    #     page_size,      # PS (no layer_id: every component's dim(0) defines
+    #                     #   its transferred layer range)
+    #     host_mappings,  # per-component HostMemoryMapping (host DVA bases)
+    # )
+
+    def test_kv_copy_d2h(self):
+        """k + v, all-layer D2H (dim_exchange test_kv_copy_d2h)."""
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        host_k.zero_()  # host is the destination; start from zero
+        host_v.zero_()
+        dev_k = (
+            _unique_like((PAGES, LAYERS, PS, 1, K_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_v = (
+            _unique_like((PAGES, LAYERS, PS, 1, V_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_idx, host_idx = _page_pairs()
+        try:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=[dev_k, dev_v],
+                dst_ptrs=[host_k, host_v],
+                src_indices=dev_idx,
+                dst_indices=host_idx,
+                page_size=PS,
+                host_mappings=[mk, mv],
+            )
+            torch.npu.synchronize()
+            self._verify_all_layers(host_k, dev_k, dev_idx, host_idx, LAYERS)
+            self._verify_all_layers(host_v, dev_v, dev_idx, host_idx, LAYERS)
+        finally:
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
+
+    def test_kv_index_k_copy_d2h(self):
+        """k + v + index_k, all-layer D2H (dim_exchange test_kv_index_k_copy_d2h).
+
+        One call carries components with different layer counts (k/v: LAYERS,
+        index_k: IDX_LAYERS); each component's dim(0) defines its own layer
+        range.
+        """
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        host_idx_k, mik = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
+        host_k.zero_()
+        host_v.zero_()
+        host_idx_k.zero_()
+        dev_k = (
+            _unique_like((PAGES, LAYERS, PS, 1, K_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_v = (
+            _unique_like((PAGES, LAYERS, PS, 1, V_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_idx_k = (
+            _unique_like((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_idx, host_idx = _page_pairs()
+        try:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=[dev_k, dev_v, dev_idx_k],
+                dst_ptrs=[host_k, host_v, host_idx_k],
+                src_indices=dev_idx,
+                dst_indices=host_idx,
+                page_size=PS,
+                host_mappings=[mk, mv, mik],
+            )
+            torch.npu.synchronize()
+            self._verify_all_layers(host_k, dev_k, dev_idx, host_idx, LAYERS)
+            self._verify_all_layers(host_v, dev_v, dev_idx, host_idx, LAYERS)
+            self._verify_all_layers(host_idx_k, dev_idx_k, dev_idx, host_idx, IDX_LAYERS)
+        finally:
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
+            unregister_host_memory(mik)
+
+    def test_k_copy_d2h(self):
+        """k only, all-layer D2H (dim_exchange test_k_copy_d2h)."""
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_k.zero_()
+        dev_k = (
+            _unique_like((PAGES, LAYERS, PS, 1, K_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_idx, host_idx = _page_pairs()
+        try:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=[dev_k],
+                dst_ptrs=[host_k],
+                src_indices=dev_idx,
+                dst_indices=host_idx,
+                page_size=PS,
+                host_mappings=[mk],
+            )
+            torch.npu.synchronize()
+            self._verify_all_layers(host_k, dev_k, dev_idx, host_idx, LAYERS)
+        finally:
+            unregister_host_memory(mk)
+
+    def test_scale_copy_d2h(self):
+        """FP32 scale only, all-layer D2H (dim_exchange test_scale_copy_d2h)."""
+        torch.npu.set_device(0)
+        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1, 1), dtype=torch.float32)
+        host_scale.zero_()
+        dev_scale = (
+            _unique_like((PAGES, IDX_LAYERS, PS, 1, 1)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.float32).to("npu")
+        )
+        dev_idx, host_idx = _page_pairs()
+        try:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=[dev_scale],
+                dst_ptrs=[host_scale],
+                src_indices=dev_idx,
+                dst_indices=host_idx,
+                page_size=PS,
+                host_mappings=[msc],
+            )
+            torch.npu.synchronize()
+            self._verify_all_layers(host_scale, dev_scale, dev_idx, host_idx, IDX_LAYERS)
+        finally:
+            unregister_host_memory(msc)
 
 
 if __name__ == "__main__":
