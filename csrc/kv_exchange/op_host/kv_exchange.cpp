@@ -92,8 +92,12 @@ void CheckComponentPair(const at::Tensor &device_buf, const at::Tensor &host_buf
                 host_buf.dim(), "-D");
     TORCH_CHECK(device_buf.size(2) == page_size, "component ", which, ": device dim(2) must equal page_size");
     TORCH_CHECK(host_buf.size(2) == page_size, "component ", which, ": host dim(2) must equal page_size");
-    TORCH_CHECK(device_buf.size(1) == host_buf.size(0), "component ", which,
-                ": device page count (dim 1) must equal host page count (dim 0)");
+    // Pool page counts deliberately differ in production and are NOT checked:
+    // the host pool is sized by --hicache-ratio (typically 2x the device pool)
+    // and the H2D device side is a staging buffer sized to the batch, so
+    // host pages >= device pages never holds an equality. The kernel only
+    // dereferences pages listed in the token indices; index range safety is
+    // the caller's contract (indices are generated per-pool-capacity).
     TORCH_CHECK(device_buf.size(3) == host_buf.size(3), "component ", which,
                 ": device and host singleton dims (dim 3) must match");
     TORCH_CHECK((device_buf.dim() == host_buf.dim()) && (device_buf.dim() == 4 ||
