@@ -24,9 +24,30 @@ IDX_WIDTH = 128  # quantized-Indexer k width
 NUM_TOKENS = PAGES * PS
 
 
+def _unique_like(shape):
+    """Deterministic per-position values, exactly representable in bf16/fp32.
+
+    value(page, layer, token) = ((page * layers + layer) * 4 + token % 4) % 256
+    - 128: unique per (page, layer) block (PAGES * LAYERS * 4 <= 256) with a
+    per-token ripple. Any misdirected write -- wrong page, layer, token or an
+    overrun row width -- changes values at the affected positions, so the
+    element-wise comparisons catch it; iid random data could hide a wrong
+    write that a later transfer overwrites (ref:
+    test_transfer_kv_dim_exchange.py's per-(layer, page) scale test).
+    """
+    pages, layers, ps = shape[0], shape[1], shape[2]
+    assert pages * layers * 4 <= 256, "block ids must stay unique and bf16-exact"
+    page = torch.arange(pages, dtype=torch.float32).view(pages, 1, 1, 1, 1)
+    layer = torch.arange(layers, dtype=torch.float32).view(1, layers, 1, 1, 1)
+    token = torch.arange(ps, dtype=torch.float32).view(1, 1, ps, 1, 1)
+    vals = ((page * layers + layer) * 4 + token % 4) % 256 - 128
+    return vals.expand(shape)
+
+
 def _host_pool(shape, dtype=torch.bfloat16):
-    """Pinned + registered host pool; returns (tensor, HostMemoryMapping)."""
-    buf = torch.randn(shape).to(dtype).pin_memory().contiguous()
+    """Pinned + registered host pool filled with deterministic unique values;
+    returns (tensor, HostMemoryMapping)."""
+    buf = _unique_like(shape).to(dtype).pin_memory().contiguous()
     mapping = register_host_memory(buf)
     return buf, mapping
 
@@ -75,10 +96,22 @@ class TestKvExchangeAclrt(unittest.TestCase):
                     [host_k, host_v], [dev_k, dev_v], host_idx, dev_idx, layer, PS,
                     host_mappings=[mk, mv],
                 )
-            torch.npu.synchronize()
-            for layer in range(LAYERS):
+                torch.npu.synchronize()
+                # Verify right after each layer: a write aimed at this layer
+                # but landing on a not-yet-transferred one would be overwritten
+                # (and masked) by the next call if only the final state were
+                # checked.
                 self._check_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
                 self._check_pages(host_v, dev_v, dev_idx, host_idx, layer, layer)
+                for untouched in range(layer + 1, LAYERS):
+                    self.assertEqual(
+                        int(torch.count_nonzero(dev_k[untouched])), 0,
+                        msg=f"dev k layer {untouched} polluted by layer {layer}'s transfer",
+                    )
+                    self.assertEqual(
+                        int(torch.count_nonzero(dev_v[untouched])), 0,
+                        msg=f"dev v layer {untouched} polluted by layer {layer}'s transfer",
+                    )
         finally:
             unregister_host_memory(mk)
             unregister_host_memory(mv)
@@ -96,17 +129,26 @@ class TestKvExchangeAclrt(unittest.TestCase):
                 transfer_kv_per_layer_direct_pf_lf(
                     [host_k], [dev_k], host_idx, dev_idx, layer, PS, host_mappings=[mk]
                 )
+                torch.npu.synchronize()
+                self._check_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
+                for untouched in range(layer + 1, LAYERS):
+                    self.assertEqual(
+                        int(torch.count_nonzero(dev_k[untouched])), 0,
+                        msg=f"dev k layer {untouched} polluted by layer {layer}'s transfer",
+                    )
             # _indexer_slot_range_for_layer-style mapping: pool layer -> indexer layer.
             for idx_layer in range(IDX_LAYERS):
                 transfer_kv_per_layer_direct_pf_lf(
                     [host_idx_k], [dev_idx_k], host_idx, dev_idx, idx_layer, PS,
                     host_mappings=[mik],
                 )
-            torch.npu.synchronize()
-            for layer in range(LAYERS):
-                self._check_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
-            for idx_layer in range(IDX_LAYERS):
+                torch.npu.synchronize()
                 self._check_pages(host_idx_k, dev_idx_k, dev_idx, host_idx, idx_layer, idx_layer)
+                for untouched in range(idx_layer + 1, IDX_LAYERS):
+                    self.assertEqual(
+                        int(torch.count_nonzero(dev_idx_k[untouched])), 0,
+                        msg=f"dev index_k layer {untouched} polluted by layer {idx_layer}'s transfer",
+                    )
         finally:
             unregister_host_memory(mk)
             unregister_host_memory(mik)
@@ -127,10 +169,24 @@ class TestKvExchangeAclrt(unittest.TestCase):
         host_idx_k.zero_()
         host_scale.zero_()
 
-        dev_k = torch.randn((LAYERS, PAGES, PS, 1, K_WIDTH), device="npu").to(torch.bfloat16)
-        dev_v = torch.randn((LAYERS, PAGES, PS, 1, V_WIDTH), device="npu").to(torch.bfloat16)
-        dev_idx_k = torch.randn((IDX_LAYERS, PAGES, PS, 1, IDX_WIDTH), device="npu").to(torch.bfloat16)
-        dev_scale = torch.randn((IDX_LAYERS, PAGES, PS, 1), device="npu", dtype=torch.float32)
+        # Layer-first device sources derived from the same deterministic values
+        # as the host pools (page-first permuted to layer-first).
+        dev_k = (
+            _unique_like((PAGES, LAYERS, PS, 1, K_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_v = (
+            _unique_like((PAGES, LAYERS, PS, 1, V_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_idx_k = (
+            _unique_like((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
+        dev_scale = (
+            _unique_like((PAGES, IDX_LAYERS, PS, 1, 1)).permute(1, 0, 2, 3, 4)
+            .contiguous().squeeze(-2).to("npu")
+        )
         dev_idx, host_idx = _page_pairs()
         try:
             transfer_kv_all_layer_direct_lf_pf(
@@ -166,8 +222,10 @@ class TestKvExchangeAclrt(unittest.TestCase):
         torch.npu.set_device(0)
         wide = 65536  # bf16 -> 128KB rows
         host, m = _host_pool((PAGES, 1, PS, 1, wide))
-        host.zero_()
-        dev = torch.randn((1, PAGES, PS, 1, wide), device="npu").to(torch.bfloat16)
+        dev = (
+            _unique_like((PAGES, 1, PS, 1, wide)).permute(1, 0, 2, 3, 4)
+            .contiguous().to(torch.bfloat16).to("npu")
+        )
         dev_idx, host_idx = _page_pairs()
         try:
             # Registry-based resolution (no host_mappings): the registered
