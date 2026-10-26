@@ -120,7 +120,9 @@ class TestKvExchangeAclrt(unittest.TestCase):
             else:
                 # Host is the source (unique values); device starts zeroed so
                 # not-yet-transferred regions can be checked to stay zero.
-                dev = torch.zeros((n_layers,) + shape[2:], dtype=dtype, device="npu")
+                dev = torch.zeros(
+                    (n_layers, shape[0]) + shape[2:], dtype=dtype, device="npu"
+                )
             comps.append((name, host, mapping, dev, n_layers))
         dev_idx, host_idx = _page_pairs()
         try:
