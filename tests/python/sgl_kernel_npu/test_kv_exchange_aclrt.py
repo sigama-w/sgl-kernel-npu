@@ -45,6 +45,8 @@ def _unique_like(shape):
     layer = torch.arange(layers, dtype=torch.float32).view(1, layers, 1, 1, 1)
     token = torch.arange(ps, dtype=torch.float32).view(1, 1, ps, 1, 1)
     vals = ((page * layers + layer) * 4 + token % 4) % 256 - 128
+    if len(shape) == 4:
+        return vals.expand(*shape, 1).squeeze(-1)
     return vals.expand(shape)
 
 
@@ -75,13 +77,17 @@ def _page_pairs():
 class TestKvExchangeAclrt(unittest.TestCase):
 
     def _verify_pages(self, host, dev, dev_idx, host_idx, host_layer, dev_layer):
-        """Element-wise: host[host_page, host_layer] == dev[dev_layer, dev_page]."""
+        """Element-wise: host[host_page, host_layer] == dev[dev_layer, dev_page].
+
+        Works for both 5-D (..., 1, width) pools and 4-D (..., 1) scale
+        caches: the (page, layer) block is flattened to (page_size, -1).
+        """
         for p in range(PAGES):
             dev_page = int(dev_idx[p * PS]) // PS
             host_page = int(host_idx[p * PS]) // PS
             torch.testing.assert_close(
-                dev[dev_layer, dev_page, :, 0, :].cpu(),
-                host[host_page, host_layer, :, 0, :].cpu(),
+                dev[dev_layer, dev_page].reshape(PS, -1).cpu(),
+                host[host_page, host_layer].reshape(PS, -1).cpu(),
                 msg=f"mismatch dev_layer={dev_layer} host_layer={host_layer} page={p}",
             )
 
@@ -133,6 +139,38 @@ class TestKvExchangeAclrt(unittest.TestCase):
                 # Verify right after each layer: a write aimed at this layer
                 # but landing on a not-yet-transferred one would be masked by
                 # the next call if only the final state were checked.
+                self._verify_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
+                self._verify_pages(host_v, dev_v, dev_idx, host_idx, layer, layer)
+                self._verify_untouched_zero(dev_k, layer, "dev_k")
+                self._verify_untouched_zero(dev_v, layer, "dev_v")
+        finally:
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
+
+    def test_kv_copy_h2d_op_resolved_dva(self):
+        """k + v, per-layer H2D with NO explicit host_mappings.
+
+        The production mla.py path: the op resolves every host base itself
+        through aclrtHostGetDevicePointer (registered from python via acl.rt),
+        so the driver lookup must see mappings created outside C++.
+        """
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        dev_k = torch.zeros((LAYERS, PAGES, PS, 1, K_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_v = torch.zeros((LAYERS, PAGES, PS, 1, V_WIDTH), dtype=torch.bfloat16, device="npu")
+        dev_idx, host_idx = _page_pairs()
+        try:
+            for layer in range(LAYERS):
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[host_k, host_v],
+                    dst_ptrs=[dev_k, dev_v],
+                    src_indices=host_idx,
+                    dst_indices=dev_idx,
+                    layer_id=layer,
+                    page_size=PS,
+                )
+                torch.npu.synchronize()
                 self._verify_pages(host_k, dev_k, dev_idx, host_idx, layer, layer)
                 self._verify_pages(host_v, dev_v, dev_idx, host_idx, layer, layer)
                 self._verify_untouched_zero(dev_k, layer, "dev_k")
@@ -213,10 +251,14 @@ class TestKvExchangeAclrt(unittest.TestCase):
             unregister_host_memory(mk)
 
     def test_scale_copy_h2d(self):
-        """FP32 scale only, per-layer H2D (dim_exchange test_scale_copy_h2d)."""
+        """FP32 scale only, per-layer H2D (dim_exchange test_scale_copy_h2d).
+
+        4-D (layers, pages, page_size, 1) operands: the production scale
+        caches carry no trailing width dim and the op accepts 4-D directly.
+        """
         torch.npu.set_device(0)
-        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1, 1), dtype=torch.float32)
-        dev_scale = torch.zeros((IDX_LAYERS, PAGES, PS, 1, 1), dtype=torch.float32, device="npu")
+        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1), dtype=torch.float32)
+        dev_scale = torch.zeros((IDX_LAYERS, PAGES, PS, 1), dtype=torch.float32, device="npu")
         dev_idx, host_idx = _page_pairs()
         try:
             for idx_layer in range(IDX_LAYERS):
@@ -348,12 +390,15 @@ class TestKvExchangeAclrt(unittest.TestCase):
             unregister_host_memory(mk)
 
     def test_scale_copy_d2h(self):
-        """FP32 scale only, all-layer D2H (dim_exchange test_scale_copy_d2h)."""
+        """FP32 scale only, all-layer D2H (dim_exchange test_scale_copy_d2h).
+
+        4-D operands, matching the production scale caches (see the H2D case).
+        """
         torch.npu.set_device(0)
-        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1, 1), dtype=torch.float32)
+        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1), dtype=torch.float32)
         host_scale.zero_()
         dev_scale = (
-            _unique_like((PAGES, IDX_LAYERS, PS, 1, 1)).permute(1, 0, 2, 3, 4)
+            _unique_like((PAGES, IDX_LAYERS, PS, 1)).permute(1, 0, 2, 3)
             .contiguous().to(torch.float32).to("npu")
         )
         dev_idx, host_idx = _page_pairs()

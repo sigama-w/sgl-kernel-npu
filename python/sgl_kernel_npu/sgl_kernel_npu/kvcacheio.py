@@ -289,22 +289,23 @@ def set_host_dva_mode(mode: str) -> None:
 
 
 def _resolve_host_dvas(host_tensors, host_mappings) -> List[int]:
-    """Explicit per-component DVA (PR #39548 style): the HostMemoryMapping
-    (or device_ptr int) if the caller passes one, otherwise the host tensor is
-    resolved through the python mapping table; 0 = unregistered, the op raises
-    a clear error for it."""
+    """Explicit per-component DVA (PR #39548 style) when the caller passes
+    ``host_mappings``; an empty list tells the op to resolve each host base
+    itself through the driver (aclrtHostGetDevicePointer -- the CUDA kernels'
+    in-op get_device_accessible_ptr equivalent)."""
+    if host_mappings is None:
+        return []
     out = []
     for i, tensor in enumerate(host_tensors):
-        m = host_mappings[i] if host_mappings and i < len(host_mappings) else None
+        m = host_mappings[i] if i < len(host_mappings) else None
         if _g_passthrough:
             # Host pointers are already device-accessible; hand them over raw
             # (mirrors the C++ ResolveHostDva passthrough fallback).
             out.append(tensor.data_ptr() if tensor.is_cpu else 0)
         elif m is None:
-            ptr = tensor.data_ptr() if tensor.is_cpu else 0
-            mapping, reg_ptr = _lookup_mapping(ptr)
+            mapping, reg_ptr = _lookup_mapping(tensor.data_ptr() if tensor.is_cpu else 0)
             out.append(
-                0 if mapping is None else mapping.device_ptr + (ptr - reg_ptr)
+                0 if mapping is None else mapping.device_ptr + (tensor.data_ptr() - reg_ptr)
             )
         elif isinstance(m, int):
             out.append(m)
@@ -326,10 +327,10 @@ def transfer_kv_per_layer_direct_pf_lf(
     H2D, one layer: registered host pool (page-first, 5-D) -> device pool
     (layer-first, 5-D). src_ptrs/dst_ptrs are matching component lists
     (k/v/index_k/index_k_scale); host-side tensors must be registered via
-    register_host_memory. ``host_mappings`` optionally carries the
-    HostMemoryMapping (or device_ptr int) per component -- PR #39548 style
-    explicit mapping; None entries or omitting the argument resolve the DVA
-    through the python mapping table instead. Signature mirrors
+    register_host_memory. By default (``host_mappings=None``) the op resolves
+    every host base itself through the driver (aclrtHostGetDevicePointer);
+    ``host_mappings`` optionally carries the HostMemoryMapping (or device_ptr
+    int) per component -- PR #39548 style explicit mapping. Signature mirrors
     sgl_kernel (CUDA).
     """
     torch.ops.npu.transfer_kv_per_layer_direct_pf_lf(

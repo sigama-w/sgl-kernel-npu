@@ -16,6 +16,8 @@
 
 #include "aclrtlaunch_kv_exchange.h"
 
+#include <acl/acl_rt.h>
+
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -79,45 +81,56 @@ void CheckComponentPair(const at::Tensor &device_buf, const at::Tensor &host_buf
     TORCH_CHECK(device_buf.scalar_type() == host_buf.scalar_type(), "component ", which,
                 ": device and host dtypes must match, got ", device_buf.scalar_type(), " vs ",
                 host_buf.scalar_type());
-    TORCH_CHECK(device_buf.dim() == 5 && host_buf.dim() == 5, "component ", which,
-                ": buffers must be 5-D -- device (layers, pages, page_size, 1, width), host "
-                "(pages, layers, page_size, 1, width), got device ", device_buf.dim(), "-D / host ",
+    // 4-D (layers, pages, page_size, 1) is accepted alongside the canonical
+    // 5-D form: the fp32 Indexer scale caches carry no trailing width dim, so
+    // the caller can hand them over without padding a singleton (width
+    // resolves to 1 below, matching the padded form).
+    TORCH_CHECK((device_buf.dim() == 5 || device_buf.dim() == 4) && (host_buf.dim() == 5 || host_buf.dim() == 4),
+                "component ", which,
+                ": buffers must be 4-D or 5-D -- device (layers, pages, page_size, [1,] width), host "
+                "(pages, layers, page_size, [1,] width), got device ", device_buf.dim(), "-D / host ",
                 host_buf.dim(), "-D");
     TORCH_CHECK(device_buf.size(2) == page_size, "component ", which, ": device dim(2) must equal page_size");
     TORCH_CHECK(host_buf.size(2) == page_size, "component ", which, ": host dim(2) must equal page_size");
     TORCH_CHECK(device_buf.size(1) == host_buf.size(0), "component ", which,
                 ": device page count (dim 1) must equal host page count (dim 0)");
-    TORCH_CHECK(device_buf.size(4) * device_buf.element_size() == host_buf.size(4) * host_buf.element_size(),
-                "component ", which, ": device and host row widths (last dim in bytes) must match");
     TORCH_CHECK(device_buf.size(3) == host_buf.size(3), "component ", which,
                 ": device and host singleton dims (dim 3) must match");
+    TORCH_CHECK((device_buf.dim() == host_buf.dim()) && (device_buf.dim() == 4 ||
+                device_buf.size(4) * device_buf.element_size() == host_buf.size(4) * host_buf.element_size()),
+                "component ", which, ": device and host row widths (last dim in bytes) must match");
     TORCH_CHECK(TrailingDimsPacked(device_buf) && TrailingDimsPacked(host_buf), "component ", which,
                 ": trailing (page_size, 1, width) dims must be packed (contiguous within a "
                 "(page, layer) block)");
 }
 
 // Host-address provider mode, selected via aclrt_set_host_dva_mode() below:
-//   false = "aclrt" (default) python resolves host pool pointers through its
-//           acl.rt mapping table and passes explicit DVAs to the transfer ops
+//   false = "aclrt" (default) host pool pointers resolve through the driver:
+//           aclrtHostGetDevicePointer(hva) -> DVA, same in-op resolution as
+//           the CUDA kernels' runtime::get_device_accessible_ptr. Registration
+//           itself lives in python (host_memory.py, PR #39548's `acl.rt`
+//           binding path); the driver's mapping is process-global, so the op
+//           sees mappings registered from python without any shared table.
 //   true  = "passthrough" host pointers are already device-accessible
-// Registration itself lives entirely in python (host_memory.py, PR #39548's
-// `acl.rt` binding path); this flag only steers the fallback resolver below.
 std::atomic<bool> g_passthrough{false};
 
 // Fallback translator for host pointers reaching the transfer ops without an
-// explicit DVA: returns the raw address in "passthrough" mode, throws
-// c10::Error in "aclrt" mode (the pointer was never registered).
+// explicit DVA: returns the raw address in "passthrough" mode, otherwise asks
+// the driver for the registered DVA and throws c10::Error for unregistered
+// pointers.
 int64_t ResolveHostDva(const void *host_ptr, uint64_t bytes)
 {
     (void)bytes;
     if (g_passthrough.load(std::memory_order_relaxed)) {
         return static_cast<int64_t>(reinterpret_cast<uintptr_t>(host_ptr));
     }
-    TORCH_CHECK(false, "host address ", host_ptr,
-                " is not registered with aclrtHostRegister; "
-                "allocate host pools via sglang pool_host alloc_with_host_register (NPU) so the "
-                "AIV kv_exchange kernel can dereference them");
-    return 0;
+    void *dva = nullptr;
+    const aclError ret = aclrtHostGetDevicePointer(const_cast<void *>(host_ptr), &dva);
+    TORCH_CHECK(ret == 0 && dva != nullptr, "aclrtHostGetDevicePointer failed for host address ", host_ptr,
+                " (ret=", static_cast<int>(ret), "); the host pool was not registered with "
+                "aclrtHostRegister -- allocate host pools via sglang pool_host "
+                "alloc_with_host_register (NPU) so the AIV kv_exchange kernel can dereference them");
+    return static_cast<int64_t>(reinterpret_cast<uintptr_t>(dva));
 }
 
 // meta layout (see op_kernel/kv_exchange_kernel.cpp):
