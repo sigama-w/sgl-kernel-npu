@@ -41,6 +41,10 @@ def _unique_like(shape):
     layer = torch.arange(layers, dtype=torch.float32).view(1, layers, 1, 1, 1)
     token = torch.arange(ps, dtype=torch.float32).view(1, 1, ps, 1, 1)
     vals = ((page * layers + layer) * 4 + token % 4) % 256 - 128
+    if len(shape) == 4:
+        # 4-D pool, e.g. the FP32 scale cache (pages, layers, page_size, 1):
+        # expand the 5-D broadcast to ...,1 then drop the trailing singleton.
+        return vals.expand(tuple(shape) + (1,)).squeeze(-1)
     return vals.expand(shape)
 
 
