@@ -11,6 +11,9 @@
 #ifndef SGL_KERNEL_NPU_OPS_H
 #define SGL_KERNEL_NPU_OPS_H
 
+#include <tuple>
+#include <vector>
+
 namespace sglang {
 namespace npu_kernel {
 at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
@@ -66,6 +69,19 @@ void transfer_state_all_layer_direct_lf_pf(at::TensorList device_states,
                                            const at::Tensor &device_indices,
                                            const at::Tensor &host_indices,
                                            int64_t flags);
+
+// AIV kv_exchange receives device-visible host addresses from the Python
+// provider; the C++ operators and AscendC kernel do not link MemFabric.
+void aclrt_set_host_dva_mode(const std::string &mode);
+void kv_exchange(const at::Tensor &meta, int64_t block_dim);
+void transfer_kv_per_layer_direct_pf_lf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
+                                        const at::Tensor &src_indices,
+                                        const at::Tensor &dst_indices, int64_t layer_id,
+                                        int64_t page_size, const std::vector<int64_t> &host_dvas);
+void transfer_kv_all_layer_direct_lf_pf(at::TensorList src_ptrs, at::TensorList dst_ptrs,
+                                        const at::Tensor &src_indices,
+                                        const at::Tensor &dst_indices, int64_t page_size,
+                                        const std::vector<int64_t> &host_dvas);
 
 at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices,
                        at::Tensor &y, int64_t slice_offset, int64_t slice_size);

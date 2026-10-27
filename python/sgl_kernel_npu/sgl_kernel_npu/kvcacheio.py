@@ -1,7 +1,22 @@
 from enum import Enum
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import torch
+
+from sgl_kernel_npu.host_memory import HostMemoryMapping
+import sgl_kernel_npu.host_memory as _hm
+
+# Registered MF blocks: (base_hva, nbytes, HostMemoryMapping). The table also
+# resolves interior tensor views to DVA + byte offset.
+_G_MAPPINGS: List[tuple] = []
+
+
+def _lookup_mapping(host_ptr: int):
+    if host_ptr:
+        for reg_ptr, nbytes, mapping in reversed(_G_MAPPINGS):
+            if reg_ptr <= host_ptr < reg_ptr + nbytes:
+                return mapping, reg_ptr
+    return None, 0
 
 
 class TransferDirection(Enum):
@@ -151,4 +166,113 @@ def transfer_mamba_state(
         device_indices,
         host_indices,
         direction.value,
+    )
+
+
+def initialize_host_memory(device_id: int, reserve_size: int) -> None:
+    """Initialize the MemFabric host-memory provider used by these wrappers."""
+    _hm.initialize_host_memory(device_id, reserve_size)
+
+
+def empty_host_memory(shape, dtype=torch.bfloat16) -> torch.Tensor:
+    """Allocate a host tensor that can be registered with MemFabric."""
+    return _hm.empty_host_memory(shape, dtype=dtype)
+
+
+def uninitialize_host_memory() -> None:
+    """Release all MF blocks and invalidate every Python-side DVA mapping."""
+    try:
+        _hm.uninitialize_host_memory()
+    finally:
+        _G_MAPPINGS.clear()
+
+
+def register_host_memory(tensor: torch.Tensor) -> HostMemoryMapping:
+    """Register an MF-allocated CPU tensor and record its DVA mapping."""
+    if not tensor.is_cpu:
+        raise RuntimeError("register_host_memory: tensor must be host (CPU) memory")
+    host_ptr = tensor.data_ptr()
+    nbytes = tensor.numel() * tensor.element_size()
+    if nbytes <= 0:
+        raise RuntimeError("register_host_memory: tensor must be non-empty")
+
+    mapping = _hm.register_host_memory(host_ptr, nbytes)
+    _G_MAPPINGS.append((host_ptr, nbytes, mapping))
+    return mapping
+
+
+def get_device_accessible_ptr(tensor: torch.Tensor, device_index: int) -> int:
+    """Resolve a registered host tensor or interior view to its device address."""
+    if not tensor.is_cpu:
+        return tensor.data_ptr()
+    host_ptr = tensor.data_ptr()
+    mapping, reg_ptr = _lookup_mapping(host_ptr)
+    if mapping is not None:
+        return mapping.device_ptr + (host_ptr - reg_ptr)
+    return host_ptr
+
+
+def _resolve_host_dvas(host_tensors, host_mappings) -> List[int]:
+    """Resolve every host component without invoking an aclrt fallback."""
+    out = []
+    for i, tensor in enumerate(host_tensors):
+        explicit = (
+            host_mappings[i]
+            if host_mappings is not None and i < len(host_mappings)
+            else None
+        )
+        if explicit is not None:
+            dva = explicit if isinstance(explicit, int) else explicit.device_ptr
+        else:
+            host_ptr = tensor.data_ptr() if tensor.is_cpu else 0
+            mapping, reg_ptr = _lookup_mapping(host_ptr)
+            if mapping is None:
+                raise RuntimeError(
+                    "MF host memory is not registered; call register_host_memory "
+                    "with an empty_host_memory tensor before transfer"
+                )
+            dva = mapping.device_ptr + (host_ptr - reg_ptr)
+        if not dva:
+            raise RuntimeError("MF host DVA must be non-zero")
+        out.append(int(dva))
+    return out
+
+
+def transfer_kv_per_layer_direct_pf_lf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    page_size: int,
+    host_mappings: Optional[Sequence] = None,
+):
+    """H2D one layer, automatically resolving registered MF host DVAs."""
+    torch.ops.npu.transfer_kv_per_layer_direct_pf_lf(
+        list(src_ptrs),
+        list(dst_ptrs),
+        src_indices,
+        dst_indices,
+        layer_id,
+        page_size,
+        _resolve_host_dvas(src_ptrs, host_mappings),
+    )
+
+
+def transfer_kv_all_layer_direct_lf_pf(
+    src_ptrs: List[torch.Tensor],
+    dst_ptrs: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int,
+    host_mappings: Optional[Sequence] = None,
+):
+    """D2H all layers, automatically resolving registered MF host DVAs."""
+    torch.ops.npu.transfer_kv_all_layer_direct_lf_pf(
+        list(src_ptrs),
+        list(dst_ptrs),
+        src_indices,
+        dst_indices,
+        page_size,
+        _resolve_host_dvas(dst_ptrs, host_mappings),
     )
