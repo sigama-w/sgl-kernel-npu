@@ -27,6 +27,7 @@ K_WIDTH = 656  # kv_lora_rank
 V_WIDTH = 64  # qk_rope_head_dim
 IDX_LAYERS = 2  # indexer-style components cover fewer layers than the pool
 IDX_WIDTH = 128  # quantized-Indexer k width
+ROUNDTRIP_ROUNDS = 20
 
 
 def _unique_like(shape):
@@ -88,6 +89,8 @@ class TestKvExchangeAclrt(unittest.TestCase):
             torch.testing.assert_close(
                 dev[dev_layer, dev_page].reshape(PS, -1).cpu(),
                 host[host_page, host_layer].reshape(PS, -1).cpu(),
+                rtol=0,
+                atol=0,
                 msg=f"mismatch dev_layer={dev_layer} host_layer={host_layer} page={p}",
             )
 
@@ -414,6 +417,134 @@ class TestKvExchangeAclrt(unittest.TestCase):
             torch.npu.synchronize()
             self._verify_all_layers(host_scale, dev_scale, dev_idx, host_idx, IDX_LAYERS)
         finally:
+            unregister_host_memory(msc)
+
+    def test_kv_index_k_scale_roundtrip(self):
+        """D2H -> zero device -> H2D must be bit-exact for every component.
+
+        The first round also checks the host backup against the original
+        device KV. Later rounds vary the page mapping and check the complete
+        roundtrip without synchronizing between individual H2D layer launches.
+        Host mappings are resolved inside the ops, as in production mla.py.
+        """
+        torch.npu.set_device(0)
+        host_k, mk = _host_pool((PAGES, LAYERS, PS, 1, K_WIDTH))
+        host_v, mv = _host_pool((PAGES, LAYERS, PS, 1, V_WIDTH))
+        host_idx_k, mik = _host_pool((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
+        host_scale, msc = _host_pool((PAGES, IDX_LAYERS, PS, 1), dtype=torch.float32)
+
+        dev_k = (
+            _unique_like((PAGES, LAYERS, PS, 1, K_WIDTH))
+            .permute(1, 0, 2, 3, 4)
+            .contiguous()
+            .to(torch.bfloat16)
+            .to("npu")
+        )
+        dev_v = (
+            _unique_like((PAGES, LAYERS, PS, 1, V_WIDTH))
+            .permute(1, 0, 2, 3, 4)
+            .contiguous()
+            .to(torch.bfloat16)
+            .to("npu")
+        )
+        dev_idx_k = (
+            _unique_like((PAGES, IDX_LAYERS, PS, 1, IDX_WIDTH))
+            .permute(1, 0, 2, 3, 4)
+            .contiguous()
+            .to(torch.bfloat16)
+            .to("npu")
+        )
+        dev_scale = (
+            _unique_like((PAGES, IDX_LAYERS, PS, 1))
+            .permute(1, 0, 2, 3)
+            .contiguous()
+            .to(torch.float32)
+            .to("npu")
+        )
+        expected = {
+            "k": dev_k.clone(),
+            "v": dev_v.clone(),
+            "index_k": dev_idx_k.clone(),
+            "scale": dev_scale.clone(),
+        }
+
+        try:
+            for round_idx in range(ROUNDTRIP_ROUNDS):
+                dev_idx, host_idx = _page_pairs()
+                host_k.zero_()
+                host_v.zero_()
+                host_idx_k.zero_()
+                host_scale.zero_()
+
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[dev_k, dev_v],
+                    dst_ptrs=[host_k, host_v],
+                    src_indices=dev_idx,
+                    dst_indices=host_idx,
+                    page_size=PS,
+                )
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=[dev_idx_k, dev_scale],
+                    dst_ptrs=[host_idx_k, host_scale],
+                    src_indices=dev_idx,
+                    dst_indices=host_idx,
+                    page_size=PS,
+                )
+                torch.npu.synchronize()
+
+                if round_idx == 0:
+                    self._verify_all_layers(
+                        host_k, expected["k"], dev_idx, host_idx, LAYERS
+                    )
+                    self._verify_all_layers(
+                        host_v, expected["v"], dev_idx, host_idx, LAYERS
+                    )
+                    self._verify_all_layers(
+                        host_idx_k, expected["index_k"], dev_idx, host_idx, IDX_LAYERS
+                    )
+                    self._verify_all_layers(
+                        host_scale, expected["scale"], dev_idx, host_idx, IDX_LAYERS
+                    )
+
+                dev_k.zero_()
+                dev_v.zero_()
+                dev_idx_k.zero_()
+                dev_scale.zero_()
+
+                for layer in range(LAYERS):
+                    transfer_kv_per_layer_direct_pf_lf(
+                        src_ptrs=[host_k, host_v],
+                        dst_ptrs=[dev_k, dev_v],
+                        src_indices=host_idx,
+                        dst_indices=dev_idx,
+                        layer_id=layer,
+                        page_size=PS,
+                    )
+                for idx_layer in range(IDX_LAYERS):
+                    transfer_kv_per_layer_direct_pf_lf(
+                        src_ptrs=[host_idx_k, host_scale],
+                        dst_ptrs=[dev_idx_k, dev_scale],
+                        src_indices=host_idx,
+                        dst_indices=dev_idx,
+                        layer_id=idx_layer,
+                        page_size=PS,
+                    )
+                torch.npu.synchronize()
+
+                for name, actual in (
+                    ("k", dev_k),
+                    ("v", dev_v),
+                    ("index_k", dev_idx_k),
+                    ("scale", dev_scale),
+                ):
+                    self.assertTrue(
+                        torch.equal(actual, expected[name]),
+                        msg=f"{name} roundtrip mismatch at round {round_idx + 1}",
+                    )
+        finally:
+            unregister_host_memory(mk)
+            unregister_host_memory(mv)
+            unregister_host_memory(mik)
             unregister_host_memory(msc)
 
 
