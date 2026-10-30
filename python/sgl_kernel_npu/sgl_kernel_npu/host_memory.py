@@ -43,12 +43,16 @@ def initialize_host_memory(device_id: int, reserve_size: int) -> None:
     config = offload.OffloadConfig()
     config.device_id = device_id
     config.reserve_size = reserve_size
+    config.alloc_size = reserve_size
     config.scene = offload.Scene.LOCAL
-    config.flags = offload.OFFLOAD_FLAG_HOST_MEM
+    # The MF binding only exposes OFFLOAD_FLAG_GIANT_PAGE (same flag the
+    # acc_offload sparse-copy path uses); it is what backs host_register /
+    # host_get_device_pointer with device-visible host memory.
+    config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
     ret = offload.initialize(config)
     if ret != 0:
         raise RuntimeError(
-            f"MF offload.initialize(OFFLOAD_FLAG_HOST_MEM) failed: ret={ret}, "
+            f"MF offload.initialize(OFFLOAD_FLAG_GIANT_PAGE) failed: ret={ret}, "
             f"device_id={device_id}, reserve_size={reserve_size}"
         )
 
