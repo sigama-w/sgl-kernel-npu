@@ -3,6 +3,30 @@ from typing import Optional, Sequence
 
 import torch
 
+from sgl_kernel_npu.host_memory import (
+    HostMemoryMapping,
+    empty_host_memory,
+    get_device_accessible_ptr,
+    initialize_host_memory,
+    register_host_memory,
+    uninitialize_host_memory,
+)
+
+__all__ = [
+    "HostMemoryMapping",
+    "TransferDirection",
+    "TransferFlag",
+    "empty_host_memory",
+    "get_device_accessible_ptr",
+    "initialize_host_memory",
+    "register_host_memory",
+    "transfer_kv_dim_exchange",
+    "transfer_mamba_state",
+    "transfer_state_all_layer_direct_lf_pf",
+    "transfer_state_per_layer_direct_pf_lf",
+    "uninitialize_host_memory",
+]
+
 
 class TransferDirection(Enum):
     H2D = 1
