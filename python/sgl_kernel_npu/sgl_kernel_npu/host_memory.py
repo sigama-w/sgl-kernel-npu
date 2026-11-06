@@ -18,7 +18,7 @@ resolves interior tensor views of either kind of block by byte offset.
 """
 
 import logging
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,16 @@ class HostMemoryMapping(NamedTuple):
 # Registered blocks: (base_hva, nbytes, HostMemoryMapping). The table also
 # resolves interior tensor views to device pointer + byte offset.
 _G_MAPPINGS: List[Tuple[int, int, HostMemoryMapping]] = []
+
+# Resolved DVA by host pointer. Persistent pool component views keep stable
+# pointers across submissions, so repeated transfers skip the registry scan.
+# Cleared whenever the mapping table changes (registration order matters:
+# later registrations shadow overlapping ones).
+_DVA_CACHE: Dict[int, int] = {}
+
+
+def _invalidate_dva_cache() -> None:
+    _DVA_CACHE.clear()
 
 
 def _lookup_mapping(host_ptr: int) -> Tuple[Optional[HostMemoryMapping], int]:
@@ -94,6 +104,7 @@ def register_host_memory(tensor: torch.Tensor) -> HostMemoryMapping:
 
     mapping = _register_host_block(host_ptr, nbytes)
     _G_MAPPINGS.append((host_ptr, nbytes, mapping))
+    _invalidate_dva_cache()
     return mapping
 
 
@@ -248,6 +259,7 @@ def register_acl_host_memory(tensor: torch.Tensor) -> HostMemoryMapping:
     # Interior views resolve against the tensor base pointer through the
     # table, so store the tensor range, not the page-aligned range.
     _G_MAPPINGS.append((host_ptr, nbytes, mapping))
+    _invalidate_dva_cache()
     return mapping
 
 
@@ -256,13 +268,19 @@ def lookup_host_dva(tensor: torch.Tensor) -> int:
 
     Returns 0 when the tensor does not fall into any registered block; there
     is no fallback because the caller decides how to handle unregistered
-    memory (e.g. resolve through offload.get_dva).
+    memory (e.g. resolve through offload.get_dva). Resolved pointers are
+    cached per host address; registration changes invalidate the cache.
     """
     host_ptr = tensor.data_ptr() if tensor.is_cpu else 0
+    cached = _DVA_CACHE.get(host_ptr)
+    if cached is not None:
+        return cached
     mapping, reg_ptr = _lookup_mapping(host_ptr)
     if mapping is None:
         return 0
-    return int(mapping.device_ptr + (host_ptr - reg_ptr))
+    dva = int(mapping.device_ptr + (host_ptr - reg_ptr))
+    _DVA_CACHE[host_ptr] = dva
+    return dva
 
 
 def resolve_host_dva(tensor: torch.Tensor) -> int:
@@ -315,3 +333,4 @@ def uninitialize_host_memory() -> None:
             _load_offload().uninitialize()
     finally:
         _G_MAPPINGS.clear()
+        _invalidate_dva_cache()

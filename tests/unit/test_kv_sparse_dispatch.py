@@ -579,5 +579,62 @@ class TestSparseDispatch(unittest.TestCase):
         self.assertIs(pairs[1][1], hs)
 
 
+class HostDvaCacheTest(unittest.TestCase):
+    """The DVA resolution cache serves repeat submissions from memory and
+    invalidates whenever the registration table changes."""
+
+    def setUp(self):
+        self.modules = patch.dict(
+            sys.modules,
+            {"torch": SimpleNamespace(Tensor=object, empty=Mock())},
+        )
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+        spec = importlib.util.spec_from_file_location(
+            "sgl_kernel_npu.host_memory",
+            ROOT / "python/sgl_kernel_npu/sgl_kernel_npu/host_memory.py",
+        )
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.host_view = SimpleNamespace(is_cpu=True, data_ptr=lambda: 0x1800)
+
+    def tearDown(self):
+        self.module._G_MAPPINGS.clear()
+        self.module._DVA_CACHE.clear()
+
+    def _register_block(self):
+        mapping = self.module.HostMemoryMapping(
+            device_ptr=0x2000, registered_host_ptr=0x1000, owned=True, kind="acl"
+        )
+        self.module._G_MAPPINGS.append((0x1000, 0x4000, mapping))
+
+    def test_repeated_resolutions_hit_the_cache(self):
+        self._register_block()
+        first = self.module.lookup_host_dva(self.host_view)
+        self.assertEqual(first, 0x2000 + 0x800)
+        self.assertEqual(self.module._DVA_CACHE, {0x1800: first})
+        # A later (shadowing) registration must not serve stale entries once
+        # the table changes through the register paths.
+        shadow = self.module.HostMemoryMapping(
+            device_ptr=0x9000, registered_host_ptr=0x1000, owned=True, kind="acl"
+        )
+        self.module._G_MAPPINGS.append((0x1000, 0x4000, shadow))
+        self.module._invalidate_dva_cache()
+        self.assertEqual(self.module.lookup_host_dva(self.host_view), 0x9800)
+
+    def test_cache_serves_resolutions_after_the_registry_empties(self):
+        self._register_block()
+        first = self.module.lookup_host_dva(self.host_view)
+        self.module._G_MAPPINGS.clear()
+        # Cleared directly (not via uninitialize): cached value still wins.
+        self.assertEqual(self.module.lookup_host_dva(self.host_view), first)
+        self.module._invalidate_dva_cache()
+        self.assertEqual(self.module.lookup_host_dva(self.host_view), 0)
+
+    def test_unregistered_memory_is_never_cached(self):
+        self.assertEqual(self.module.lookup_host_dva(self.host_view), 0)
+        self.assertEqual(self.module._DVA_CACHE, {})
+
+
 if __name__ == "__main__":
     unittest.main()
