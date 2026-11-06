@@ -79,7 +79,7 @@ Each `(page,layer)` payload must be contiguous; gaps between pages in Host layer
 
 ## aiv
 
-Resolves registered Host device addresses through `host_memory.resolve_host_dva` and submits through the in-tree `kv_exchange` CANN operator (`torch.ops.npu.kv_exchange`): the C++ adapter builds the device-resident 44-slot metadata -- actual layer/page strides, full-page byte width, PF/LF traversal mode and per-component layer ranges -- and launches the AIV kernel on the caller's stream. The pinned staging that carries the metadata upload is returned to the wrapper and retained until the completion event.
+Resolves registered Host device addresses through `host_memory.resolve_host_dva` and submits through the in-tree `kv_exchange` CANN operator (`torch.ops.npu.kv_exchange`): the C++ adapter packs the transfer description -- actual layer/page strides, full-page byte width, PF/LF traversal mode and per-component layer ranges -- into the kernel launch parameter block and launches the AIV kernel on the caller's stream. The description never round-trips through device memory: no device-resident meta, no pinned staging and no separate H2D meta upload remain on the submission path.
 
 The AIV path requires MF `host_register` / `host_get_device_pointer` support. Initialize `Scene.LOCAL` with `OFFLOAD_FLAG_HOST_MEM`, allocate Host buffers with `offload.empty`, and call `host_memory.register_host_memory` once per full allocation before passing its views to the transfer APIs.
 
