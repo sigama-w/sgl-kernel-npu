@@ -80,10 +80,13 @@ void kv_exchange_event_pool_wait(int64_t pool_id, int64_t index)
 bool kv_exchange_event_pool_query(int64_t pool_id, int64_t index)
 {
     const aclrtEvent event = LookupEvent(pool_id, index);
-    aclrtBool done = ACL_FALSE;
-    const aclError status = aclrtEventQuery(event, &done);
-    TORCH_CHECK(status == ACL_SUCCESS, "aclrtEventQuery failed with status ", static_cast<int64_t>(status));
-    return done == ACL_TRUE;
+    // CANN exposes event completion via aclrtQueryEvent, not a CUDA-style
+    // aclrtEventQuery: the status enum reports ACL_EVENT_COMPLETE when all
+    // commands captured by the event have finished.
+    aclrtEventStatus done = ACL_EVENT_WAIT;
+    const aclError status = aclrtQueryEvent(event, &done);
+    TORCH_CHECK(status == ACL_SUCCESS, "aclrtQueryEvent failed with status ", static_cast<int64_t>(status));
+    return done == ACL_EVENT_COMPLETE;
 }
 
 void kv_exchange_event_pool_destroy(int64_t pool_id)
