@@ -62,6 +62,7 @@ set(OP_SRCS
     ${PROJECT_OP_SRC_BASE}/build_tree/op_host/build_tree.cpp
     ${PROJECT_OP_SRC_BASE}/transfer_kv_dim_exchange/op_host/transfer_kv_dim_exchange.cpp
     ${PROJECT_OP_SRC_BASE}/kv_exchange/op_host/kv_exchange.cpp
+    ${PROJECT_OP_SRC_BASE}/kv_exchange/op_host/event_pool.cpp
     ${PROJECT_OP_SRC_BASE}/kv_exchange/torch_adapter.cpp
     ${PROJECT_OP_SRC_BASE}/transfer_mamba_state/op_host/transfer_mamba_state.cpp
     ${PROJECT_OP_SRC_BASE}/transfer_state_dim_exchange/op_host/transfer_state_dim_exchange.cpp
