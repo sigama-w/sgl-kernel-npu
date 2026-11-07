@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "op_host/event_pool.h"
+#include "event_pool.h"
 
 #include <mutex>
 #include <unordered_map>

@@ -17,7 +17,7 @@
 
 #include "torch_helper.h"
 
-#include "op_host/event_pool.h"
+#include "event_pool.h"
 
 #include "aclrtlaunch_kv_exchange.h"
 
