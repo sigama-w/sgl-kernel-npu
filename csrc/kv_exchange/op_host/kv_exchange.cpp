@@ -481,14 +481,21 @@ HOST_API void kv_exchange_submit_range(
 
     // One record_stream pass covers every launch above: all launches share
     // the current stream, and stream-ordered reuse only needs one mark.
+    // Absent components ride along as CPU empty placeholders; record_stream
+    // has no CPU kernel, so only real NPU tensors get marked.
+    const auto record_stream_if_npu = [&npuStream](const at::Tensor &t) {
+        if (t.device().type() == c10::DeviceType::PrivateUse1) {
+            t.record_stream(npuStream);
+        }
+    };
     for (int64_t p = 0; p < num_pools; ++p) {
         const size_t sp = static_cast<size_t>(p);
         for (const auto *list : {&device_k, &device_v, &device_index_k, &device_index_scale}) {
-            (*list)[sp].record_stream(npuStream);
+            record_stream_if_npu((*list)[sp]);
         }
     }
-    device_indices.record_stream(npuStream);
-    host_indices.record_stream(npuStream);
+    record_stream_if_npu(device_indices);
+    record_stream_if_npu(host_indices);
 }
 
 }  // namespace npu_kernel
