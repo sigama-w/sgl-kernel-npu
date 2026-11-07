@@ -24,6 +24,7 @@
 // memfabric_hybrid offload.kv_exchange_copy call that used to build the
 // meta in Python, and the later pinned-staging H2D meta upload).
 
+#include "op_host/event_pool.h"
 #include "op_host/kv_exchange.h"
 
 #include <torch/library.h>
@@ -36,9 +37,37 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
         "Tensor[] device_components, Tensor[] host_components, "
         "int[] host_dvas, int page_size, int direction, int host_layout) "
         "-> ()");
+    m.def(
+        "kv_exchange_range("
+        "Tensor device_indices, Tensor host_indices, "
+        "Tensor[] device_k, Tensor[] host_k, "
+        "Tensor[] device_v, Tensor[] host_v, "
+        "Tensor[] device_index_k, Tensor[] host_index_k, "
+        "Tensor[] device_index_k_scale, Tensor[] host_index_k_scale, "
+        "int[] host_dvas, int page_size, int direction, int host_layout, "
+        "int num_ctrl_layers, int[] iter_table, int[] pool_iter_counts, "
+        "int event_pool_id, int event_first_index) -> ()");
+    // Event-pool control surface for the fused per-layer submission path.
+    m.def("kv_exchange_event_pool_create(int count) -> int");
+    m.def("kv_exchange_event_pool_record(int pool_id, int index) -> ()");
+    m.def("kv_exchange_event_pool_wait(int pool_id, int index) -> ()");
+    m.def("kv_exchange_event_pool_query(int pool_id, int index) -> bool");
+    m.def("kv_exchange_event_pool_destroy(int pool_id) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 {
     m.impl("kv_exchange", TORCH_FN(sglang::npu_kernel::kv_exchange_submit));
+    m.impl("kv_exchange_range", TORCH_FN(sglang::npu_kernel::kv_exchange_submit_range));
+}
+
+// These control-plane operators have no Tensor arguments, so backend dispatch
+// cannot infer PrivateUse1 from their inputs.
+TORCH_LIBRARY_IMPL(npu, CatchAll, m)
+{
+    m.impl("kv_exchange_event_pool_create", TORCH_FN(sglang::npu_kernel::kv_exchange_event_pool_create));
+    m.impl("kv_exchange_event_pool_record", TORCH_FN(sglang::npu_kernel::kv_exchange_event_pool_record));
+    m.impl("kv_exchange_event_pool_wait", TORCH_FN(sglang::npu_kernel::kv_exchange_event_pool_wait));
+    m.impl("kv_exchange_event_pool_query", TORCH_FN(sglang::npu_kernel::kv_exchange_event_pool_query));
+    m.impl("kv_exchange_event_pool_destroy", TORCH_FN(sglang::npu_kernel::kv_exchange_event_pool_destroy));
 }

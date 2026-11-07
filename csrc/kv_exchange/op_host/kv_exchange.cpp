@@ -17,6 +17,8 @@
 
 #include "torch_helper.h"
 
+#include "op_host/event_pool.h"
+
 #include "aclrtlaunch_kv_exchange.h"
 
 #include <cstdint>
@@ -160,6 +162,73 @@ void FillComponent(ComponentParams &cp, const at::Tensor &device_buf, const at::
     cp.fields[8] = layer_hi;
 }
 
+// Per-pool component geometry for the fused range submission: full-tensor
+// bases and pitches, so each iteration only folds its layer offsets in.
+struct RangeComponent {
+    bool active = false;
+    int64_t dev_base = 0;         // device buffer base address
+    int64_t dev_layer_pitch = 0;  // bytes
+    int64_t dev_page_pitch = 0;   // bytes
+    int64_t host_dva = 0;
+    int64_t host_page_pitch = 0;  // bytes
+    int64_t host_layer_pitch = 0;  // bytes
+    int64_t width = 0;            // packed bytes of one (page, layer) row
+};
+
+// Build the geometry from one paired full view. Empty (numel == 0) views
+// stay inactive and never join a launch.
+void FillRangeComponent(RangeComponent &rc, const at::Tensor &device_buf, const at::Tensor &host_buf, int64_t dva,
+                        int64_t page_size, int64_t pool, const char *name)
+{
+    if (!device_buf.defined() || !host_buf.defined() || !device_buf.numel() || !host_buf.numel()) {
+        return;
+    }
+    CheckNpuTensor(device_buf, "range pool component");
+    TORCH_CHECK(host_buf.device().type() == at::kCPU, "range pool ", pool, ": host ", name,
+                " component must be a CPU (MemFabric-mapped) tensor");
+    CheckComponentPair(device_buf, host_buf, page_size, pool);
+    TORCH_CHECK(dva != 0, "range pool ", pool, ": host ", name, " component DVA must be non-zero");
+    const int64_t esz = device_buf.element_size();
+    rc.dev_base = static_cast<int64_t>(reinterpret_cast<uintptr_t>(device_buf.data_ptr()));
+    rc.dev_layer_pitch = device_buf.stride(0) * esz;
+    rc.dev_page_pitch = device_buf.stride(1) * esz;
+    rc.host_dva = dva;
+    rc.host_page_pitch = host_buf.stride(0) * esz;
+    rc.host_layer_pitch = host_buf.stride(1) * esz;
+    int64_t width = esz;
+    for (int64_t i = 2; i < host_buf.dim(); ++i) {
+        width *= host_buf.size(i);
+    }
+    rc.width = width;
+    rc.active = true;
+}
+
+// Pack one (device_layer, host_layer) iteration of a component into the
+// launch parameter block: same field layout as FillComponent with the layer
+// offsets folded into the bases instead of the views.
+void PackRangeComponent(ComponentParams &cp, const RangeComponent &rc, int64_t device_layer, int64_t host_layer)
+{
+    cp.fields[0] = rc.dev_base + device_layer * rc.dev_layer_pitch;
+    cp.fields[1] = rc.host_dva + host_layer * rc.host_layer_pitch;
+    cp.fields[2] = rc.dev_layer_pitch;
+    cp.fields[3] = rc.dev_page_pitch;
+    cp.fields[4] = rc.host_page_pitch;
+    cp.fields[5] = rc.host_layer_pitch;
+    cp.fields[6] = rc.width;
+    cp.fields[7] = 0;
+    cp.fields[8] = 1;
+}
+
+// Row offset of pool p's iterations inside the flat iter_table.
+int64_t RowOffset(const std::vector<int64_t> &pool_iter_counts, int64_t pool)
+{
+    int64_t offset = 0;
+    for (int64_t i = 0; i < pool; ++i) {
+        offset += pool_iter_counts[static_cast<size_t>(i)];
+    }
+    return offset;
+}
+
 // Index uploads are the caller's (python) job; only the async-use lifetime
 // is recorded here, on the stream the kernel launches on.
 void RecordStreamLifetime(at::TensorList device_components, const at::Tensor &device_indices,
@@ -244,6 +313,182 @@ HOST_API void kv_exchange_submit(const at::Tensor &device_indices, const at::Ten
                     page_size_local, direction_local, host_layout_local, start_dim, KV_COMPONENT_ARGS(0),
                     KV_COMPONENT_ARGS(1), KV_COMPONENT_ARGS(2), KV_COMPONENT_ARGS(3));
     RecordStreamLifetime(device_components, device_indices, host_indices);
+}
+
+/*
+ * Fused per-layer H2D submission (see kv_exchange.h). One Python call covers
+ * every controller layer of every pool: the per-layer "launch kv_exchange,
+ * then record the layer-done event" sequence runs as a C++ loop, so the
+ * per-layer Python dispatch overhead disappears while the per-layer event
+ * granularity -- and therefore the implicit forward/transfer pipeline --
+ * stays bit-identical to the Python loop.
+ */
+HOST_API void kv_exchange_submit_range(
+    const at::Tensor &device_indices, const at::Tensor &host_indices, at::TensorList device_k,
+    at::TensorList host_k, at::TensorList device_v, at::TensorList host_v, at::TensorList device_index_k,
+    at::TensorList host_index_k, at::TensorList device_index_scale, at::TensorList host_index_scale,
+    const std::vector<int64_t> &host_dvas, int64_t page_size, int64_t direction, int64_t host_layout_mode,
+    int64_t num_ctrl_layers, const std::vector<int64_t> &iter_table,
+    const std::vector<int64_t> &pool_iter_counts, int64_t event_pool_id, int64_t event_first_index)
+{
+    constexpr int64_t kMaxPools = 4;
+    TORCH_CHECK(direction == kDirectionH2D, "range submission is H2D only, got direction ", direction);
+    TORCH_CHECK(host_layout_mode == kHostLayoutPageFirst || host_layout_mode == kHostLayoutLayerFirst,
+                "host_layout_mode must be page_first (0) or layer_first (1), got ", host_layout_mode);
+    TORCH_CHECK(page_size > 0, "page_size must be positive, got ", page_size);
+    TORCH_CHECK(num_ctrl_layers > 0, "num_ctrl_layers must be positive, got ", num_ctrl_layers);
+    const int64_t num_pools = static_cast<int64_t>(pool_iter_counts.size());
+    TORCH_CHECK(num_pools > 0 && num_pools <= kMaxPools, "pool count must be in [1, ", kMaxPools, "], got ",
+                num_pools);
+    TORCH_CHECK(device_k.size() == host_k.size() && static_cast<int64_t>(device_k.size()) == num_pools,
+                "device_k/host_k must hold one full buffer per pool");
+    TORCH_CHECK(device_v.size() == host_v.size() && static_cast<int64_t>(device_v.size()) == num_pools,
+                "device_v/host_v must hold one buffer per pool");
+    TORCH_CHECK(device_index_k.size() == host_index_k.size() && static_cast<int64_t>(device_index_k.size()) ==
+                                                                             num_pools,
+                "device_index_k/host_index_k must hold one buffer per pool");
+    TORCH_CHECK(device_index_scale.size() == host_index_scale.size() &&
+                    static_cast<int64_t>(device_index_scale.size()) == num_pools,
+                "device_index_scale/host_index_scale must hold one buffer per pool");
+    TORCH_CHECK(host_dvas.size() == static_cast<size_t>(4 * num_pools),
+                "host_dvas must hold 4 DVAs (k, v, index_k, index_scale) per pool, got ", host_dvas.size());
+    int64_t total_iters = 0;
+    for (int64_t p = 0; p < num_pools; ++p) {
+        TORCH_CHECK(pool_iter_counts[static_cast<size_t>(p)] >= 0, "pool ", p,
+                    ": iteration count must be nonnegative");
+        total_iters += pool_iter_counts[static_cast<size_t>(p)];
+    }
+    TORCH_CHECK(static_cast<int64_t>(iter_table.size()) == 4 * total_iters,
+                "iter_table must hold 4 entries per pool iteration, got ", iter_table.size(), " for ",
+                total_iters, " iterations");
+    TORCH_CHECK(event_pool_id < 0 || event_first_index >= 0, "event_first_index must be nonnegative");
+
+    CheckNpuTensor(device_indices, "device_indices");
+    CheckNpuTensor(host_indices, "host_indices");
+    TORCH_CHECK(device_indices.numel() == host_indices.numel(), "device/host indices must have the same length");
+    TORCH_CHECK(device_indices.numel() % page_size == 0, "indices size must be divisible by page_size");
+    const int64_t num_pages = device_indices.numel() / page_size;
+
+    // Resolve the per-pool component geometry once; per-iteration packing then
+    // only folds layer offsets into the bases.
+    RangeComponent comps[kMaxPools][kMaxComponents] = {};
+    for (int64_t p = 0; p < num_pools; ++p) {
+        const size_t sp = static_cast<size_t>(p);
+        const int64_t dv = host_dvas[static_cast<size_t>(4 * p + 1)];
+        const int64_t dik = host_dvas[static_cast<size_t>(4 * p + 2)];
+        const int64_t dis = host_dvas[static_cast<size_t>(4 * p + 3)];
+        FillRangeComponent(comps[p][0], device_k[sp], host_k[sp], host_dvas[static_cast<size_t>(4 * p)], page_size,
+                           p, "k");
+        TORCH_CHECK(comps[p][0].active, "range pool ", p, ": K component must be nonempty");
+        FillRangeComponent(comps[p][1], device_v[sp], host_v[sp], dv, page_size, p, "v");
+        FillRangeComponent(comps[p][2], device_index_k[sp], host_index_k[sp], dik, page_size, p, "index_k");
+        FillRangeComponent(comps[p][3], device_index_scale[sp], host_index_scale[sp], dis, page_size, p,
+                           "index_scale");
+        // Paired Indexer components must arrive together, mirroring the
+        // per-layer select_components contract.
+        TORCH_CHECK(comps[p][2].active == comps[p][3].active, "range pool ", p,
+                    ": index_k and index_scale must be supplied together");
+    }
+
+    // Validate the iteration table against the pool geometries up front so
+    // the launch loop below cannot produce out-of-range addresses.
+    for (int64_t p = 0; p < num_pools; ++p) {
+        const int64_t count = pool_iter_counts[static_cast<size_t>(p)];
+        const int64_t offset = RowOffset(pool_iter_counts, p);
+        int64_t prev_ctrl = -1;
+        for (int64_t i = 0; i < count; ++i) {
+            const int64_t *row = &iter_table[static_cast<size_t>(4 * (offset + i))];
+            const int64_t ctrl = row[0], dev_layer = row[1], host_layer = row[2], slot = row[3];
+            TORCH_CHECK(ctrl > prev_ctrl, "range pool ", p, ": iteration rows must be sorted by ctrl layer");
+            prev_ctrl = ctrl;
+            TORCH_CHECK(ctrl >= 0 && ctrl < num_ctrl_layers, "range pool ", p, ": ctrl layer ", ctrl,
+                        " out of [0, ", num_ctrl_layers, ")");
+            TORCH_CHECK(dev_layer >= 0 && dev_layer < static_cast<int64_t>(device_k[static_cast<size_t>(p)].size(0)),
+                        "range pool ", p, ": device layer ", dev_layer, " out of range");
+            TORCH_CHECK(host_layer >= 0 && host_layer < static_cast<int64_t>(host_k[static_cast<size_t>(p)].size(1)),
+                        "range pool ", p, ": host layer ", host_layer, " out of range");
+            if (slot >= 0) {
+                TORCH_CHECK(comps[p][2].active && comps[p][3].active, "range pool ", p,
+                            ": index slot ", slot, " supplied without index components");
+                TORCH_CHECK(slot < static_cast<int64_t>(device_index_k[static_cast<size_t>(p)].size(0)),
+                            "range pool ", p, ": index slot ", slot, " out of range");
+                TORCH_CHECK(slot < static_cast<int64_t>(host_index_k[static_cast<size_t>(p)].size(1)),
+                            "range pool ", p, ": index host slot ", slot, " out of range");
+            }
+        }
+    }
+
+    // Hoisted launch parameters (EXEC_KERNEL_CMD needs named lvalues).
+    const int64_t num_pages_local = num_pages;
+    const int64_t page_size_local = page_size;
+    const int64_t direction_local = direction;
+    const int64_t host_layout_local = host_layout_mode;
+    const int64_t start_dim = ResolveStartDim();
+    const uint32_t block_dim_u32 = ResolveBlockDim();
+    const auto npuStream = c10_npu::getCurrentNPUStream();
+
+    // One cursor per pool over its (ctrl-sorted) iteration rows.
+    int64_t cursor[kMaxPools] = {0};
+    for (int64_t ctrl = 0; ctrl < num_ctrl_layers; ++ctrl) {
+        if (num_pages > 0) {
+            for (int64_t p = 0; p < num_pools; ++p) {
+                const int64_t offset = RowOffset(pool_iter_counts, p);
+                const int64_t count = pool_iter_counts[static_cast<size_t>(p)];
+                if (cursor[p] >= count) {
+                    continue;
+                }
+                const int64_t *row = &iter_table[static_cast<size_t>(4 * (offset + cursor[p]))];
+                if (row[0] != ctrl) {
+                    continue;
+                }
+                ++cursor[p];
+                // Same component contract as the per-layer path: K/V always
+                // ride along, the Indexer pair only for iterations with a
+                // slot. Inactive components never join the launch.
+                ComponentParams launch[kMaxComponents] = {};
+                int64_t active = 0;
+                for (int64_t c = 0; c < kMaxComponents; ++c) {
+                    if (!comps[p][c].active || (c >= 2 && row[3] < 0)) {
+                        continue;
+                    }
+                    // Index components select their row by the iteration's
+                    // index slot; K/V select it by the device/host layers.
+                    const int64_t layer = (c >= 2) ? row[3] : row[1];
+                    const int64_t host_layer = (c >= 2) ? row[3] : row[2];
+                    PackRangeComponent(launch[active], comps[p][c], layer, host_layer);
+                    ++active;
+                }
+                const int64_t launch_components = active;
+                EXEC_KERNEL_CMD(kv_exchange, block_dim_u32, device_indices, host_indices, launch_components,
+                                num_pages_local, page_size_local, direction_local, host_layout_local, start_dim,
+                                launch[0].fields[0], launch[0].fields[1], launch[0].fields[2], launch[0].fields[3],
+                                launch[0].fields[4], launch[0].fields[5], launch[0].fields[6], launch[0].fields[7],
+                                launch[0].fields[8], launch[1].fields[0], launch[1].fields[1], launch[1].fields[2],
+                                launch[1].fields[3], launch[1].fields[4], launch[1].fields[5], launch[1].fields[6],
+                                launch[1].fields[7], launch[1].fields[8], launch[2].fields[0], launch[2].fields[1],
+                                launch[2].fields[2], launch[2].fields[3], launch[2].fields[4], launch[2].fields[5],
+                                launch[2].fields[6], launch[2].fields[7], launch[2].fields[8], launch[3].fields[0],
+                                launch[3].fields[1], launch[3].fields[2], launch[3].fields[3], launch[3].fields[4],
+                                launch[3].fields[5], launch[3].fields[6], launch[3].fields[7], launch[3].fields[8]);
+            }
+        }
+        // Events fire for every controller layer -- including layers no pool
+        // covers -- mirroring the Python loop's per-layer on_layer_done.
+        if (event_pool_id >= 0) {
+            kv_exchange_event_pool_record(event_pool_id, event_first_index + ctrl);
+        }
+    }
+
+    // One record_stream pass covers every launch above: all launches share
+    // the current stream, and stream-ordered reuse only needs one mark.
+    for (int64_t p = 0; p < num_pools; ++p) {
+        const size_t sp = static_cast<size_t>(p);
+        for (const auto *list : {&device_k, &device_v, &device_index_k, &device_index_scale}) {
+            (*list)[sp].record_stream(npuStream);
+        }
+    }
+    device_indices.record_stream(npuStream);
+    host_indices.record_stream(npuStream);
 }
 
 }  // namespace npu_kernel

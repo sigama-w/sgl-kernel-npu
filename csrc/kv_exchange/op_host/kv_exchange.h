@@ -37,6 +37,27 @@ HOST_API void kv_exchange_submit(const at::Tensor &device_indices, const at::Ten
                                  const std::vector<int64_t> &host_dvas, int64_t page_size, int64_t direction,
                                  int64_t host_layout_mode);
 
+// Fused per-layer H2D submission: one call covers every controller layer of
+// every pool, and records one event per controller layer from the event pool
+// (op_host/event_pool.h) right after that layer's launches -- the C++
+// equivalent of the Python "for layer: submit all pools; event.record()"
+// loop, minus the per-layer Python dispatch overhead. Pool p's components
+// arrive as FULL tensors (no per-layer slicing): device_k[p]/host_k[p] etc.
+// carry all layers and host_dvas holds four DVAs per pool (k, v, index_k,
+// index_scale; 0 = component absent). iter_table is a flat [ctrl, dev_layer,
+// host_layer, index_slot] row per pool iteration (pools concatenated, rows
+// sorted by ctrl within each pool); pool_iter_counts[p] bounds pool p's rows.
+// Index rows use index_slot as both the device and host layer. Per iteration
+// each active component transfers exactly one layer selected by the row.
+// event_pool_id < 0 skips event recording (no forward-side consumer).
+HOST_API void kv_exchange_submit_range(
+    const at::Tensor &device_indices, const at::Tensor &host_indices, at::TensorList device_k,
+    at::TensorList host_k, at::TensorList device_v, at::TensorList host_v, at::TensorList device_index_k,
+    at::TensorList host_index_k, at::TensorList device_index_scale, at::TensorList host_index_scale,
+    const std::vector<int64_t> &host_dvas, int64_t page_size, int64_t direction, int64_t host_layout_mode,
+    int64_t num_ctrl_layers, const std::vector<int64_t> &iter_table,
+    const std::vector<int64_t> &pool_iter_counts, int64_t event_pool_id, int64_t event_first_index);
+
 }  // namespace npu_kernel
 }  // namespace sglang
 

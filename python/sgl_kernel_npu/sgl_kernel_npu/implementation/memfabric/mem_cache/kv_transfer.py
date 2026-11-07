@@ -201,3 +201,168 @@ def transfer_kv(
         di = device_indices.contiguous()
         hi = host_indices.contiguous()
         _submit_aiv(components, di, hi, page_size, direction, host_layout)  # fmt: skip
+
+
+def _range_host_view(host, host_layout):
+    """PF-shaped metadata view of one full host component buffer."""
+    if host_layout == "layer_first":
+        return host.transpose(0, 1)
+    return host
+
+
+def _range_dva(view):
+    if not view.numel():
+        return 0
+    return _resolve_host_dva(view)
+
+
+def transfer_kv_range(
+    device_indices,
+    host_indices,
+    device_k,
+    host_k,
+    device_v,
+    host_v,
+    device_index_k=None,
+    host_index_k=None,
+    device_index_k_scale=None,
+    host_index_k_scale=None,
+    page_size=128,
+    *,
+    host_layout,
+    direction,
+    num_ctrl_layers,
+    iter_table,
+    pool_iter_counts,
+    event_pool_id=-1,
+    event_first_index=0,
+):
+    """Submit every pool's per-layer H2D program in one call.
+
+    The per-pool lists hold FULL component buffers (no per-layer slicing);
+    iter_table rows [ctrl, device_layer, host_layer, index_slot] select one
+    layer per launch inside the C++ loop, which also records one event per
+    controller layer from the kv_exchange event pool. Same component contract
+    as transfer_kv: paired components only, K mandatory, V optional, the
+    Indexer pair optional per pool and per iteration (slot < 0).
+    """
+    if page_size <= 0 or device_indices.ndim != 1 or host_indices.ndim != 1:
+        raise ValueError("expected positive page_size and 1-D token indices")
+    if device_indices.dtype != torch.int64 or host_indices.dtype != torch.int64:
+        raise ValueError("KV indices must have dtype int64")
+    if (
+        device_indices.numel() != host_indices.numel()
+        or device_indices.numel() % page_size
+    ):
+        raise ValueError("indices must describe equal numbers of complete pages")
+    if direction != 1:
+        raise ValueError("the fused range submission is H2D only (direction 1)")
+    if host_layout not in ("page_first", "layer_first"):
+        raise ValueError("host_layout must be page_first or layer_first")
+    num_pools = len(pool_iter_counts)
+    if not num_pools or any(
+        x is None or len(x) != num_pools for x in (device_k, host_k, device_v, host_v)
+    ):
+        raise ValueError("per-pool component lists must match pool_iter_counts")
+    # Absent optional components arrive as None lists; normalize to per-pool
+    # None entries (handled as empty placeholders below).
+    device_index_k = [None] * num_pools if device_index_k is None else device_index_k
+    host_index_k = [None] * num_pools if host_index_k is None else host_index_k
+    device_index_k_scale = (
+        [None] * num_pools if device_index_k_scale is None else device_index_k_scale
+    )
+    host_index_k_scale = (
+        [None] * num_pools if host_index_k_scale is None else host_index_k_scale
+    )
+    if any(
+        len(x) != num_pools
+        for x in (
+            device_index_k,
+            host_index_k,
+            device_index_k_scale,
+            host_index_k_scale,
+        )
+    ):
+        raise ValueError("per-pool component lists must match pool_iter_counts")
+    if not device_indices.numel():
+        # Nothing to transfer, but events still fire per controller layer.
+        if event_pool_id >= 0:
+            for layer in range(num_ctrl_layers):
+                torch.ops.npu.kv_exchange_event_pool_record(
+                    event_pool_id, event_first_index + layer
+                )
+        return
+    device = device_k[0].device
+    if device.type != "npu":
+        raise ValueError("KV Device buffers must be NPU tensors")
+    if device_indices.device != device or host_indices.device != device:
+        raise ValueError("KV indices must be on the KV buffer's NPU")
+
+    # Normalize per-pool buffers: PF-shaped host views, 5-D Indexer scales.
+    host_dvas = []
+    norm = dict(
+        dev_k=[], host_k=[], dev_v=[], host_v=[],
+        dev_ik=[], host_ik=[], dev_is=[], host_is=[],
+    )
+    empty = torch.empty(0)
+    for pool in range(num_pools):
+        for key, dev_buf, host_buf in (
+            ("k", device_k[pool], host_k[pool]),
+            ("v", device_v[pool], host_v[pool]),
+            ("ik", device_index_k[pool], host_index_k[pool]),
+            ("is", device_index_k_scale[pool], host_index_k_scale[pool]),
+        ):
+            if dev_buf is None or host_buf is None:
+                # None marks an absent optional component (e.g. a pool
+                # without V); the empty placeholder keeps it out of every
+                # launch, while a half-supplied pair stays an error.
+                if dev_buf is not None or host_buf is not None:
+                    raise ValueError(
+                        "paired range components must both be supplied or omitted"
+                    )
+                dev_buf = host_buf = empty
+            if dev_buf.numel() and host_buf.numel():
+                if dev_buf.ndim != 5 or host_buf.ndim != 5:
+                    raise ValueError(
+                        "range components must be five-dimensional (pad Indexer scales)"
+                    )
+                if dev_buf.dtype != host_buf.dtype or dev_buf.shape[2:] != host_buf.shape[2:]:
+                    raise ValueError("range component dtypes and page shapes must match")
+                host_view = _range_host_view(host_buf, host_layout)
+                norm["dev_" + key].append(dev_buf)
+                norm["host_" + key].append(host_view)
+                host_dvas.append(_range_dva(host_view))
+            else:
+                if dev_buf.numel() != host_buf.numel():
+                    raise ValueError("paired range components must both be empty or nonempty")
+                norm["dev_" + key].append(dev_buf)
+                norm["host_" + key].append(host_buf)
+                host_dvas.append(0)
+    if not norm["dev_k"][0].numel():
+        raise ValueError("range pool 0: K buffers must be nonempty")
+    if len(iter_table) != 4 * sum(pool_iter_counts):
+        raise ValueError("iter_table must hold 4 entries per pool iteration")
+
+    # Host addresses resolve through the registered DVA table (MF or aclrt).
+    # Input lifetime needs no Python-side event bookkeeping: the C++ adapter
+    # record_stream's every NPU input once for all launches.
+    with _submit_lock, torch.npu.device(device):
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("AIV KV transfer does not support NPU graph capture")
+        torch.ops.npu.kv_exchange_range(
+            device_indices.contiguous(),
+            host_indices.contiguous(),
+            norm["dev_k"], norm["host_k"],
+            norm["dev_v"], norm["host_v"],
+            norm["dev_ik"], norm["host_ik"],
+            norm["dev_is"], norm["host_is"],
+            host_dvas,
+            page_size,
+            direction,
+            int(host_layout == "layer_first"),
+            num_ctrl_layers,
+            list(iter_table),
+            list(pool_iter_counts),
+            event_pool_id,
+            event_first_index,
+        )

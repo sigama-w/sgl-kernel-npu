@@ -84,3 +84,106 @@ def transfer_kv(
                 else:
                     host_page.copy_(device_page.cpu())
     torch.npu.current_stream(device_k.device).synchronize()
+
+
+def transfer_kv_range(
+    device_indices,
+    host_indices,
+    device_k,
+    host_k,
+    device_v,
+    host_v,
+    device_index_k=None,
+    host_index_k=None,
+    device_index_k_scale=None,
+    host_index_k_scale=None,
+    page_size=128,
+    *,
+    host_layout,
+    direction,
+    num_ctrl_layers,
+    iter_table,
+    pool_iter_counts,
+    event_pool_id=-1,
+    event_first_index=0,
+):
+    """Synchronous reference for the fused per-layer H2D range submission.
+
+    Replays the iter_table one controller layer at a time through the
+    per-layer reference copy, recording one event-pool event per controller
+    layer after that layer's copies retire (when an event pool is supplied).
+    """
+    if direction != 1:
+        raise ValueError("range submission is H2D only")
+    if host_layout not in ("page_first", "layer_first"):
+        raise ValueError("invalid Host layout")
+    if page_size <= 0 or device_indices.ndim != 1 or host_indices.ndim != 1:
+        raise ValueError("expected positive page_size and one-dimensional indices")
+    if device_indices.dtype != torch.int64 or host_indices.dtype != torch.int64:
+        raise ValueError("KV indices must have dtype int64")
+    if device_indices.numel() != host_indices.numel() or device_indices.numel() % page_size:
+        raise ValueError("indices must describe equal numbers of complete pages")
+    num_pools = len(pool_iter_counts)
+    if not num_pools or any(
+        x is None or len(x) != num_pools for x in (device_k, host_k, device_v, host_v)
+    ):
+        raise ValueError("per-pool component lists must match pool_iter_counts")
+    # Absent optional components arrive as None lists; normalize to per-pool
+    # None entries so the replay loop can skip them uniformly.
+    device_index_k = [None] * num_pools if device_index_k is None else device_index_k
+    host_index_k = [None] * num_pools if host_index_k is None else host_index_k
+    device_index_k_scale = (
+        [None] * num_pools if device_index_k_scale is None else device_index_k_scale
+    )
+    host_index_k_scale = (
+        [None] * num_pools if host_index_k_scale is None else host_index_k_scale
+    )
+    if any(len(x) != num_pools for x in (device_index_k, host_index_k, device_index_k_scale, host_index_k_scale)):
+        raise ValueError("per-pool component lists must match pool_iter_counts")
+
+    empty = torch.empty(0)
+    # actions[ctrl] = (pool, device_layer, host_layer, slot) launches for that layer.
+    actions = [[] for _ in range(num_ctrl_layers)]
+    offset = 0
+    for pool, count in enumerate(pool_iter_counts):
+        for i in range(count):
+            ctrl, dev_layer, host_layer, slot = iter_table[4 * (offset + i): 4 * (offset + i) + 4]
+            if not 0 <= ctrl < num_ctrl_layers:
+                raise ValueError("iteration row ctrl layer out of range")
+            actions[ctrl].append((pool, dev_layer, host_layer, slot))
+        offset += count
+    for ctrl in range(num_ctrl_layers):
+        for pool, dev_layer, host_layer, slot in actions[ctrl]:
+            for dev, host, is_index in (
+                (device_k[pool], host_k[pool], False),
+                (device_v[pool], host_v[pool], False),
+                (device_index_k[pool], host_index_k[pool], True),
+                (device_index_k_scale[pool], host_index_k_scale[pool], True),
+            ):
+                if is_index and slot < 0:
+                    continue
+                if dev is None or host is None or not dev.numel() or not host.numel():
+                    continue
+                layer = slot if is_index else dev_layer
+                host_layer_id = slot if is_index else host_layer
+                transfer_kv(
+                    device_indices,
+                    host_indices,
+                    dev,
+                    host,
+                    empty,
+                    empty,
+                    None,
+                    None,
+                    None,
+                    None,
+                    page_size,
+                    host_layout=host_layout,
+                    direction=1,
+                    kv_layers=(layer, host_layer_id, 1),
+                    index_layers=(0, 0, 0),
+                )
+        if event_pool_id >= 0:
+            torch.ops.npu.kv_exchange_event_pool_record(
+                event_pool_id, event_first_index + ctrl
+            )

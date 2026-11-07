@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -577,6 +577,166 @@ class TestSparseDispatch(unittest.TestCase):
         self.assertEqual(pairs[0], (k, h))
         self.assertEqual(pairs[1][0].shape, (2, 8, 4, 1, 1))
         self.assertIs(pairs[1][1], hs)
+
+
+class RangeSubmissionTest(unittest.TestCase):
+    """The fused range wrapper submits one op call and defers layer-done
+    events to the C++ loop (recorded from Python only for empty transfers)."""
+
+    def setUp(self):
+        self.range_submit = Mock(return_value=None)
+        self.pool_record = Mock(return_value=None)
+        self.torch = SimpleNamespace(
+            Tensor=Tensor,
+            empty=lambda *a, **k: Tensor((0,), CPU),
+            int64="int64",
+            npu=SimpleNamespace(
+                device=lambda _: Context(),
+                current_stream=lambda: Stream(),
+                is_current_stream_capturing=Mock(return_value=False),
+            ),
+            ops=SimpleNamespace(
+                npu=SimpleNamespace(
+                    kv_exchange_range=self.range_submit,
+                    kv_exchange_event_pool_record=self.pool_record,
+                )
+            ),
+        )
+        self.modules = patch.dict(
+            sys.modules,
+            {
+                "torch": self.torch,
+                "memfabric_hybrid": SimpleNamespace(offload=SimpleNamespace()),
+            },
+        )
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+        module_name = "sgl_kernel_npu.implementation.memfabric.mem_cache.kv_transfer"
+        path = (
+            ROOT
+            / "python/sgl_kernel_npu/sgl_kernel_npu/implementation/memfabric/mem_cache/kv_transfer.py"
+        )
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def _components(self, with_indexer=True):
+        return dict(
+            device_k=[Tensor((4, 8, 4, 1, 7))],
+            host_k=[Tensor((10, 4, 4, 1, 7), CPU)],
+            device_v=[Tensor((4, 8, 4, 1, 2))],
+            host_v=[Tensor((10, 4, 4, 1, 2), CPU)],
+            device_index_k=[Tensor((2, 8, 4, 1, 3))] if with_indexer else None,
+            host_index_k=[Tensor((10, 2, 4, 1, 3), CPU)] if with_indexer else None,
+            device_index_k_scale=[Tensor((2, 8, 4, 1, 1))] if with_indexer else None,
+            host_index_k_scale=[Tensor((10, 2, 4, 1, 1), CPU)] if with_indexer else None,
+        )
+
+    def _submit(self, iter_table, num_ctrl_layers=4, **overrides):
+        kwargs = {**self._components(), **overrides}
+        kwargs.setdefault("direction", 1)
+        with patch.object(self.module, "_resolve_host_dva", return_value=1 << 44):
+            self.module.transfer_kv_range(
+                Tensor((8,)),
+                Tensor((8,)),
+                page_size=kwargs.pop("page_size", 4),
+                host_layout="page_first",
+                direction=kwargs.pop("direction"),
+                num_ctrl_layers=num_ctrl_layers,
+                iter_table=iter_table,
+                pool_iter_counts=[len(iter_table) // 4],
+                event_pool_id=7,
+                event_first_index=12,
+                **kwargs,
+            )
+
+    def test_range_submits_every_layer_in_one_call(self):
+        iter_table = [0, 0, 0, 0, 1, 1, 1, -1, 3, 3, 3, 1]
+        self._submit(iter_table)
+        self.assertEqual(self.range_submit.call_count, 1)
+        args = self.range_submit.call_args.args
+        self.assertEqual(args[2][0].shape, (4, 8, 4, 1, 7))  # device_k list
+        self.assertEqual(args[3][0].shape, (10, 4, 4, 1, 7))  # host_k list
+        self.assertEqual(args[10], [1 << 44] * 4)  # host_dvas: k, v, ik, is
+        self.assertEqual(args[11], 4)  # page_size
+        self.assertEqual(args[12], 1)  # direction
+        self.assertEqual(args[13], 0)  # page_first
+        self.assertEqual(args[14], 4)  # num_ctrl_layers
+        self.assertEqual(args[15], iter_table)
+        self.assertEqual(args[16], [3])
+        self.assertEqual(args[17], 7)  # event pool id
+        self.assertEqual(args[18], 12)  # event first index
+        # The C++ loop records the layer-done events; Python submits nothing else.
+        self.pool_record.assert_not_called()
+
+    def test_range_layer_first_host_gets_pf_shaped_view(self):
+        iter_table = [0, 0, 0, -1]
+        with patch.object(self.module, "_resolve_host_dva", return_value=1 << 44):
+            self.module.transfer_kv_range(
+                Tensor((8,)),
+                Tensor((8,)),
+                page_size=4,
+                host_layout="layer_first",
+                direction=1,
+                num_ctrl_layers=2,
+                iter_table=iter_table,
+                pool_iter_counts=[1],
+                event_pool_id=-1,
+                device_k=[Tensor((4, 8, 4, 1, 7))],
+                host_k=[Tensor((4, 10, 4, 1, 7), CPU)],
+                device_v=[Tensor((0,))],
+                host_v=[Tensor((0,), CPU)],
+            )
+        args = self.range_submit.call_args.args
+        self.assertEqual(args[3][0].shape, (10, 4, 4, 1, 7))  # transposed view
+        self.assertEqual(args[13], 1)  # layer_first
+        self.assertEqual(args[10], [1 << 44, 0, 0, 0])  # only K carries a DVA
+
+    def test_range_none_components_stay_inactive(self):
+        self._submit([0, 0, 0, -1], device_v=[None], host_v=[None])
+        args = self.range_submit.call_args.args
+        self.assertEqual(args[10], [1 << 44, 0, 0, 0])
+        # Device/host placeholder entries are the shared empty tensor.
+        self.assertEqual(args[4][0].numel(), 0)
+        self.assertEqual(args[5][0].numel(), 0)
+
+    def test_range_rejects_half_supplied_pairs(self):
+        with self.assertRaisesRegex(ValueError, "paired range components"):
+            self._submit([0, 0, 0, -1], device_v=[None])
+        with self.assertRaisesRegex(ValueError, "paired range components"):
+            self._submit([0, 0, 0, -1], host_index_k=[Tensor((0,), CPU)])
+        self.range_submit.assert_not_called()
+
+    def test_range_empty_indices_records_pool_events_per_layer(self):
+        with patch.object(self.module, "_resolve_host_dva", return_value=1 << 44):
+            self.module.transfer_kv_range(
+                Tensor((0,)),
+                Tensor((0,)),
+                page_size=4,
+                host_layout="page_first",
+                direction=1,
+                num_ctrl_layers=3,
+                iter_table=[],
+                pool_iter_counts=[0],
+                event_pool_id=3,
+                event_first_index=5,
+                **self._components(),
+            )
+        self.range_submit.assert_not_called()
+        self.assertEqual(
+            self.pool_record.call_args_list,
+            [call(3, 5), call(3, 6), call(3, 7)],
+        )
+
+    def test_range_rejects_bad_iter_table_length(self):
+        with self.assertRaisesRegex(ValueError, "4 entries per pool iteration"):
+            self._submit([0, 0, 0])
+        self.range_submit.assert_not_called()
+
+    def test_range_rejects_non_h2d_direction(self):
+        with self.assertRaisesRegex(ValueError, "H2D only"):
+            self._submit([0, 0, 0, -1], direction=2)
+        self.range_submit.assert_not_called()
 
 
 class HostDvaCacheTest(unittest.TestCase):
