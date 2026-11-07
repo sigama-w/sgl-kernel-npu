@@ -55,6 +55,19 @@ int64_t kv_exchange_event_pool_create(int64_t count)
         TORCH_CHECK(status == ACL_SUCCESS && event != nullptr,
                     "aclrtCreateEvent failed with status ", static_cast<int64_t>(status));
     }
+    // Pre-record every slot once on an otherwise idle stream: aclrtQueryEventStatus
+    // reports an unrecorded aclrtEvent as NOT_READY, whereas a torch.npu.Event that
+    // was never recorded queries as complete (CUDA semantics). The ring slots are
+    // asserted complete on first reuse before any real submission has recorded
+    // them, so they must start out in the recorded-complete state. A record on an
+    // empty stream captures no work and completes almost immediately; later
+    // submissions re-record the slots with their real per-layer completions.
+    const auto stream = c10_npu::getCurrentNPUStream().stream(false);
+    for (auto event : events) {
+        const aclError status = aclrtRecordEvent(event, stream);
+        TORCH_CHECK(status == ACL_SUCCESS, "aclrtRecordEvent failed with status ",
+                    static_cast<int64_t>(status));
+    }
     const std::lock_guard<std::mutex> lock(g_event_pool_mutex);
     const int64_t pool_id = g_next_event_pool_id++;
     g_event_pools.emplace(pool_id, std::move(events));
